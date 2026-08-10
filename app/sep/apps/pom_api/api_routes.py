@@ -62,15 +62,16 @@ from app.sep.apps.pom_api.schemas import (
     RunCounts,
     RunError,
 )
+from app.sep.apps.pom_worker.config import pom_worker_settings
 from app.sep.apps.pom_worker.crud import PomRunManager
 from app.sep.apps.pom_worker.models import (
     NodeResolution,
     PomCluster,
     PomNode,
     PomRun,
-    PomRunStatus,
 )
 from app.sep.apps.pom_worker.projection import build_summary
+from app.sep.apps.pom_worker.reap import sweep_stale_runs
 from app.sep.deps import SessionDep
 
 logger = logging.getLogger(__name__)
@@ -106,11 +107,6 @@ router = APIRouter(dependencies=[Depends(_swagger_bearer)])
 #: How old a snapshot may be before responses mark it stale. It is still served --
 #: the UI shows stale data with a marker rather than an error page.
 SNAPSHOT_GRACE = timedelta(minutes=30)
-
-#: How long a ``RUNNING`` row is trusted before the trigger assumes its process died.
-#: Without this a crashed run wedges the trigger permanently, which is the same
-#: failure already recorded in bugs/sep-stale-running-blocks-execution.md.
-RUN_STALE_AFTER = timedelta(minutes=30)
 
 #: Display labels for the health buckets the list view groups by, worst first.
 _HEALTH_LABELS = (
@@ -330,25 +326,20 @@ async def trigger_discovery(session: SessionDep) -> DiscoveryRunAccepted:
     # in the Celery app, which the API process does not otherwise need.
     from app.sep.apps.pom_worker.celery import run_pom_discovery
 
+    # Reap before reading, so a row whose process died cannot answer 409 on behalf of
+    # a run nothing is executing. ``reap_stale_pom_runs`` normally gets there first;
+    # this covers the deployment whose beat is not running, where the sweep would
+    # never fire and a stranded row would otherwise wedge the trigger permanently.
+    # Whatever is still RUNNING afterwards is young enough to believe. The sweep
+    # commits in a session of its own (see its docstring), so this reads the result
+    # back rather than relying on anything it left in ``session``.
+    await sweep_stale_runs(pom_worker_settings.STALE_RUN_AFTER)
     in_flight = await running_run(session)
-    if in_flight is not None and utc_now() - in_flight.started_at < RUN_STALE_AFTER:
+    if in_flight is not None:
         raise HTTPConflictException(
             f"Discovery run {in_flight.id} is already in progress; "
             "wait for it to finish."
         )
-    if in_flight is not None:
-        # Past the cutoff its process is gone. Fail it rather than let a stranded
-        # row block every future trigger.
-        logger.warning(
-            "POM API: run %s has been RUNNING since %s; marking it failed so a new "
-            "run can start",
-            in_flight.id,
-            in_flight.started_at,
-        )
-        in_flight.status = PomRunStatus.FAILED
-        in_flight.finished_at = utc_now()
-        in_flight.error = "abandoned: no completion recorded before the stale cutoff"
-        await PomRunManager.save(session, in_flight)
 
     run = await PomRunManager.save(session, PomRun())
     run_pom_discovery.delay(str(run.id))

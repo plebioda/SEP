@@ -25,11 +25,15 @@ at call time.
 
 __all__ = ["PomWorkerSettings", "pom_worker_settings"]
 
-from typing import ClassVar
+from datetime import timedelta
+from typing import Annotated, ClassVar
 
+from annotated_types import Gt
 from pydantic import PositiveInt
 
+from app.core.celery.models import IntervalSchedule, Period
 from app.core.config import BaseYamlSettings
+from app.core.utils.fields import TimedeltaSeconds
 
 
 class PomWorkerSettings(BaseYamlSettings):
@@ -75,6 +79,17 @@ class PomWorkerSettings(BaseYamlSettings):
     :param METRICS_QUERY_BATCH: Services pinned per query. Each contributes a 37-byte
         UUID to a regex matcher, so this bounds the query string rather than the
         result set.
+    :param STALE_RUN_AFTER: How long a run may stay ``RUNNING`` before the sweep
+        concludes its worker is gone and fails it. Must comfortably exceed the slowest
+        legitimate run, or a healthy collection is failed mid-flight while it is still
+        probing -- the ceiling on that is ``TASK_TIMEOUT`` per dispatched task, with
+        ``MAX_CONCURRENT_PROBES`` in flight at a time. The trigger endpoint reads the
+        same value, so a ``RUNNING`` row is refused a concurrent trigger and swept by
+        the same clock.
+    :param STALE_SWEEP_INTERVAL: Cadence of the ``reap_stale_pom_runs`` sweep.
+        ``None`` unregisters it entirely, which leaves the trigger endpoint as the
+        only thing that reaps -- and a stranded run then keeps the UI's Sync button
+        disabled until someone calls the endpoint some other way.
     """
 
     SETTINGS_PREFIXES: ClassVar[list[str]] = ["SEP", "POM_WORKER"]
@@ -92,6 +107,12 @@ class PomWorkerSettings(BaseYamlSettings):
     METRICS_LOOKBACK: str = "24h"
     METRICS_MAX_AGE: PositiveInt = 300
     METRICS_QUERY_BATCH: PositiveInt = 50
+    STALE_RUN_AFTER: Annotated[TimedeltaSeconds, Gt(timedelta(0))] = timedelta(
+        minutes=30
+    )
+    STALE_SWEEP_INTERVAL: IntervalSchedule | None = IntervalSchedule(
+        every=5, period=Period.MINUTES
+    )
 
 
 pom_worker_settings: PomWorkerSettings = PomWorkerSettings()

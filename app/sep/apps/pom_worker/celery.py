@@ -26,6 +26,8 @@ from uuid import UUID
 
 from app.celery import celery
 from app.sep.app_drain import owned_by
+from app.sep.apps.pom_worker.config import pom_worker_settings
+from app.sep.apps.pom_worker.reap import sweep_stale_runs
 from app.sep.apps.pom_worker.service import run_discovery
 
 logger = logging.getLogger(__name__)
@@ -49,3 +51,22 @@ def run_pom_discovery(execution_id: str | None = None) -> str:
         run_discovery(UUID(execution_id) if execution_id else None)
     )
     return str(resolved)
+
+
+@owned_by("pom_worker")
+@celery.task
+def reap_stale_pom_runs() -> int:
+    """Fail discovery runs whose worker never recorded a terminal status.
+
+    Scheduled by this app's ``periodic_task_schedules`` contribution. Nothing else
+    advances such a row, and both the trigger endpoint and the UI's Sync button treat
+    it as a live run, so without this sweep one lost worker wedges discovery until
+    someone intervenes by hand.
+
+    :return: The number of runs failed.
+    """
+    return len(
+        celery.loop.run_until_complete(
+            sweep_stale_runs(pom_worker_settings.STALE_RUN_AFTER)
+        )
+    )
