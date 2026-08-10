@@ -113,9 +113,11 @@ async def get_run(session: AsyncSession, run_id: UUID) -> PomRun | None:
 async def running_run(session: AsyncSession) -> PomRun | None:
     """Return a discovery run that is currently in flight, if any.
 
-    Used to refuse a concurrent trigger. Note that a run whose process died leaves
-    its row ``RUNNING`` forever, which would wedge the trigger permanently -- the
-    caller pairs this with a staleness cutoff rather than trusting the status alone.
+    Used to refuse a concurrent trigger. Reports the stored status and nothing more:
+    a run whose process died leaves its row ``RUNNING`` forever and is indistinguishable
+    here from a live one, so the caller reaps aged rows
+    (:func:`~app.sep.apps.pom_worker.reap.sweep_stale_runs`) before reading this rather
+    than trusting the status alone.
 
     :param session: The database session.
     :return: The in-flight run, or ``None``.

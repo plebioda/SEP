@@ -25,11 +25,43 @@ The registration exists for three side effects, not for a user-facing surface:
 
 It ships no router and no UI: this is a Celery job, driven from a shell or a beat
 entry. ``sidebar=False`` keeps it out of the navigation, since there is nothing to
-navigate to.
+navigate to. The abandoned-run sweep is contributed via ``periodic_task_schedules``.
 """
 
-from app.sep.apps.framework.base import BaseApp
+from typing import cast
+
+from app.core.celery.models import IntervalSchedule
+from app.sep.apps.framework.base import AppPeriodicTask, BaseApp
 from app.sep.apps.nav_icons import NavIcon
+from app.sep.apps.pom_worker.config import pom_worker_settings
+
+
+def _pom_worker_periodic_tasks() -> list[AppPeriodicTask]:
+    """Contribute the abandoned-run sweep while it is configured.
+
+    ``STALE_SWEEP_INTERVAL`` may be ``None`` to unregister the sweep, so this is a
+    callable: the contribution is variable-length (0 or 1) and a plain list literal
+    would commit to a fixed set at ``BaseApp(...)`` construction.
+
+    Contributed by ``pom_worker`` rather than ``pom_api`` because the schedule is only
+    seeded for an app that owns a Celery module, and this is the app whose module the
+    worker imports. Disabling ``pom_worker`` therefore stops the sweep along with the
+    collection it cleans up after, which is the intended pairing.
+
+    :return: The sweep contrib, or an empty list when the sweep is disabled.
+    """
+    if pom_worker_settings.STALE_SWEEP_INTERVAL is None:
+        return []
+    return [
+        AppPeriodicTask(
+            name="sep__reap_stale_pom_runs",
+            task="reap_stale_pom_runs",
+            schedule=lambda: cast(
+                IntervalSchedule, pom_worker_settings.STALE_SWEEP_INTERVAL
+            ),
+        ),
+    ]
+
 
 app = BaseApp(
     name="pom_worker",
@@ -38,4 +70,5 @@ app = BaseApp(
     css_class="pom",
     sidebar=False,
     nav_icon=NavIcon.MONGO,
+    periodic_task_schedules=_pom_worker_periodic_tasks,
 )
