@@ -66,9 +66,23 @@ VERSION_INFO = "mongodb_version_info"
 #: health rule wants; this one is a single series describing the node being asked.
 MEMBERS_SELF = "mongodb_members_self"
 
+#: Seconds a peer trails the primary's optime. **Several series per service** -- one per
+#: (reporting node, secondary peer) -- so its signal must carry a reducer.
+#:
+#: The primary itself appears as a peer in no series: the exporter derives lag against
+#: the primary's optime, so it has none by construction. A single-member replica set
+#: therefore emits nothing at all, which is *not applicable* rather than *not collected*.
+REPLICATION_LAG = "mongodb_mongod_replset_member_replication_lag"
+#: Oplog bounds as epoch seconds; their difference is the window. One series per
+#: service each, so neither needs a reducer. A standalone emits neither -- no replica
+#: set, no oplog.
+OPLOG_HEAD = "mongodb_mongod_replset_oplog_head_timestamp"
+OPLOG_TAIL = "mongodb_mongod_replset_oplog_tail_timestamp"
+
 #: Signal groups, each independently switchable via ``SEP.POM_WORKER.METRICS_GROUPS``.
 GROUP_IDENTITY = "identity"
 GROUP_RS_STATUS = "rs_status"
+GROUP_REPLICATION = "replication"
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,12 +146,20 @@ class Signal:
         window, say -- needs an explicit escape hatch added here first.
     :param take: How to read the value: :class:`Label` or :class:`Value`.
     :param group: The switchable group this belongs to.
+    :param reduce: Folds several series for one service into one fact, e.g. :func:`max`.
+        ``None`` keeps the one-series-per-service assumption every other signal relies
+        on. Required whenever a metric emits more than one series per service:
+        ``merge_facts`` keeps the *first* fact for a ``(service, field)`` pair, so
+        without a reducer the document would silently carry an arbitrary series' value.
+        That bug is near-invisible on an idle estate, where every series reads the same
+        number and the wrong answer looks right.
     """
 
     field: str
     metric: str
     take: Label | Value
     group: str
+    reduce: Callable[[list[Any]], Any] | None = None
 
 
 #: Exactly the signals the status document requires -- nothing speculative. Between
@@ -155,6 +177,25 @@ SIGNALS: tuple[Signal, ...] = (
     Signal("edition", VERSION_INFO, Label("edition"), GROUP_IDENTITY),
     # -- mongodb_members_self: this node's own replica-set state ----------------
     Signal("state", MEMBERS_SELF, Label("member_state"), GROUP_RS_STATUS),
+    # -- replication health: the first Value signals in the catalog -------------
+    # ``max`` over every series a service reports: each member reports lag against
+    # every secondary, so the worst of them is "the worst lag this node saw", and the
+    # cluster's max over its members is "the worst lag anyone saw in this replica set".
+    # Double-counting is harmless under max.
+    Signal(
+        "replication_lag_seconds",
+        REPLICATION_LAG,
+        Value(float),
+        GROUP_REPLICATION,
+        reduce=max,
+    ),
+    # Fetched as two raw values and subtracted in the projection rather than as one
+    # PromQL expression: ``Signal.metric`` is a bare metric name by design, because the
+    # collector appends its own ``{service_id=~"…"}`` matcher. Keeping the collector to
+    # one-signal-one-metric costs two extra round trips and no escape hatch in the
+    # query builder.
+    Signal("oplog_head_timestamp", OPLOG_HEAD, Value(float), GROUP_REPLICATION),
+    Signal("oplog_tail_timestamp", OPLOG_TAIL, Value(float), GROUP_REPLICATION),
 )
 
 

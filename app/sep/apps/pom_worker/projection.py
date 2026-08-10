@@ -38,6 +38,7 @@ Three rules the shape enforces, all of them corrections to the naive version:
 import hashlib
 from collections import Counter
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from datetime import datetime
 from typing import Any
 
@@ -53,10 +54,19 @@ SCHEMA_VERSION = 2
 CONFIG_SERVER_PORT = 27019
 SHARD_SERVER_PORT = 27018
 
+#: A replica set needs at least this many members for any of them to report lag:
+#: lag is measured against the primary's optime, so a lone member has no peer.
+_MIN_LAG_MEMBERS = 2
+
 #: ``unavailable`` reasons. Kept as constants because the frontend matches on them.
 REASON_NOT_OBSERVED = "service_not_observed"
 REASON_METRIC_NOT_COLLECTED = "metric_not_collected"
 REASON_NO_VERSION_CATALOG = "no_version_catalog"
+#: The topology cannot have this field at all -- a standalone or a router has no
+#: replica-set oplog, and a single-member replica set has no secondary to lag. Distinct
+#: from ``metric_not_collected``, which means the field *should* exist and did not
+#: arrive: one is a fact about the estate, the other a gap in collection.
+REASON_NOT_APPLICABLE = "not_applicable"
 
 #: Health states, worst first — the order `_worst` folds over.
 HEALTH_CRITICAL = "critical"
@@ -101,6 +111,11 @@ class NodeRecord:
     :param resolution: How the executor was matched, or that it was not.
     :param probe_status: Whether the probe returned a usable record.
     :param probe: The probe record, when one came back.
+    :param facts: The run's merged facts for this service, in the *serialised* shape
+        ``{field: {"value": …, "source": …, "observed_at": …}}`` -- not
+        ``{field: value}``. The provenance is kept rather than flattened because health
+        rules need to know whether a reading is four seconds or four days old, and
+        because :attr:`metrics_observed` is derived from the ``source`` key.
     """
 
     service_name: str
@@ -113,14 +128,42 @@ class NodeRecord:
     resolution: str
     probe_status: str
     probe: dict[str, Any] | None
+    facts: dict[str, Any] = dataclass_field(default_factory=dict)
 
     @property
     def observed(self) -> bool:
-        """Return whether this service produced a usable probe record.
+        """Return whether this service produced a usable **probe** record.
 
-        :return: ``True`` when the node answered.
+        Note the narrowness: this says nothing about metrics coverage. A service that
+        VictoriaMetrics describes perfectly well but Nomad cannot reach is *not*
+        ``observed`` -- and at fleet scale that is the majority. Use
+        :attr:`metrics_observed` when the question is "did we see this at all".
+
+        :return: ``True`` when the node answered a probe.
         """
         return self.probe_status == "ok" and bool(self.probe)
+
+    @property
+    def metrics_observed(self) -> bool:
+        """Return whether any merged fact for this service came from VictoriaMetrics.
+
+        :return: ``True`` when the metrics source covered this service.
+        """
+        return any(
+            isinstance(entry, dict) and entry.get("source") == "metrics"
+            for entry in self.facts.values()
+        )
+
+
+def _fact(record: NodeRecord, name: str) -> Any:
+    """Return one merged fact's value, or ``None`` when the run did not observe it.
+
+    :param record: The node record.
+    :param name: The fact's field name.
+    :return: The value, or ``None``.
+    """
+    entry = record.facts.get(name)
+    return entry.get("value") if isinstance(entry, dict) else None
 
 
 def cluster_id(
@@ -205,11 +248,80 @@ def _worst(statuses: list[str]) -> str:
     return HEALTH_UNKNOWN
 
 
-def _member_document(record: NodeRecord, *, sharded: bool) -> dict[str, Any]:
+def _has_oplog(record: NodeRecord) -> bool:
+    """Return whether this member can have an oplog at all.
+
+    Only a replica-set member does. A standalone and a mongos router both carry no
+    ``replication_set``, which is exactly the two cases that have no oplog -- so the one
+    check covers both.
+
+    :param record: The node record.
+    :return: ``True`` when an oplog window is meaningful for this member.
+    """
+    return bool(record.replication_set)
+
+
+def _has_lag(record: NodeRecord, replica_set_sizes: dict[str, int]) -> bool:
+    """Return whether this member can report replication lag.
+
+    Needs an oplog *and* a peer to lag behind: the exporter derives lag against the
+    primary's optime, so a single-member replica set emits no lag series at all. That
+    is *not applicable*, not a collection gap.
+
+    :param record: The node record.
+    :param replica_set_sizes: Member counts per replica set within the cluster.
+    :return: ``True`` when a lag reading is meaningful for this member.
+    """
+    if not _has_oplog(record):
+        return False
+    return replica_set_sizes.get(record.replication_set or "", 0) >= _MIN_LAG_MEMBERS
+
+
+def _replication_reason(*, metrics_observed: bool, applicable: bool) -> str:
+    """Return why a replication field is null.
+
+    Order matters and is deliberate: "we saw nothing of this service" outranks "this
+    topology cannot have the field", because an unobserved service's topology claim
+    rests on inventory alone and the honest answer is that we do not know.
+
+    :param metrics_observed: Whether VictoriaMetrics covered the subject at all.
+    :param applicable: Whether the topology can carry the field.
+    :return: The reason code.
+    """
+    if not metrics_observed:
+        return REASON_NOT_OBSERVED
+    if not applicable:
+        return REASON_NOT_APPLICABLE
+    return REASON_METRIC_NOT_COLLECTED
+
+
+def _oplog_window(record: NodeRecord) -> float | None:
+    """Return one member's oplog window in seconds.
+
+    ``head`` and ``tail`` come from the same scrape, so subtracting two separately
+    queried values is safe in practice -- their ages differ by tens of milliseconds. The
+    ``head >= tail`` guard still rejects the pathological case (mismatched scrapes, clock
+    skew) as *unknown* rather than surfacing a negative duration, which the frontend's
+    duration formatter renders as a blank cell rather than an em-dash.
+
+    :param record: The node record.
+    :return: The window in seconds, or ``None`` when it cannot be computed.
+    """
+    head = _fact(record, "oplog_head_timestamp")
+    tail = _fact(record, "oplog_tail_timestamp")
+    if head is None or tail is None or head < tail:
+        return None
+    return head - tail
+
+
+def _member_document(
+    record: NodeRecord, *, sharded: bool, replica_set_sizes: dict[str, int]
+) -> dict[str, Any]:
     """Build one member entry.
 
     :param record: The node record.
     :param sharded: Whether the owning cluster is sharded, which adds ``role``.
+    :param replica_set_sizes: Member counts per replica set, for lag applicability.
     :return: The member document.
     """
     database = (record.probe or {}).get("database") or {}
@@ -231,15 +343,33 @@ def _member_document(record: NodeRecord, *, sharded: bool) -> dict[str, Any]:
         "server_running": process.get("running"),
         "server_process": process.get("program"),
         "uptime_seconds": process.get("uptime_sec"),
+        "replication_lag_seconds": _fact(record, "replication_lag_seconds"),
+        "oplog_window_seconds": _oplog_window(record),
     }
     if sharded:
         member["role"] = _sharded_role(record)
+
+    unavailable: dict[str, str] = {}
     if not record.observed:
-        member["unavailable"] = {
-            "state": REASON_NOT_OBSERVED,
-            "running_version": REASON_NOT_OBSERVED,
-            "installed_version": REASON_NOT_OBSERVED,
-        }
+        unavailable.update(
+            {
+                "state": REASON_NOT_OBSERVED,
+                "running_version": REASON_NOT_OBSERVED,
+                "installed_version": REASON_NOT_OBSERVED,
+            }
+        )
+    # Every null carries a reason -- including these two, so the detail page can say
+    # *why* a member shows no lag rather than leaving a bare dash.
+    for name, applicable in (
+        ("replication_lag_seconds", _has_lag(record, replica_set_sizes)),
+        ("oplog_window_seconds", _has_oplog(record)),
+    ):
+        if member[name] is None:
+            unavailable[name] = _replication_reason(
+                metrics_observed=record.metrics_observed, applicable=applicable
+            )
+    if unavailable:
+        member["unavailable"] = unavailable
     return member
 
 
@@ -343,6 +473,22 @@ def _versions(members: list[dict[str, Any]]) -> tuple[dict[str, Any], dict[str, 
     )
 
 
+def _aggregate(members: list[dict[str, Any]], field: str, fold: Any) -> float | None:
+    """Fold one numeric member field across a cluster, ignoring nulls.
+
+    A null member value is *absent*, not zero -- folding it in would make an unobserved
+    member look like a perfectly-caught-up one under ``max``, and would peg every
+    cluster's oplog window to zero under ``min``.
+
+    :param members: The member documents.
+    :param field: The field to fold.
+    :param fold: :func:`max` or :func:`min`.
+    :return: The folded value, or ``None`` when no member reported one.
+    """
+    values = [m[field] for m in members if m.get(field) is not None]
+    return fold(values) if values else None
+
+
 def _classify(records: list[NodeRecord]) -> str:
     """Return the topology type for one cluster label's services.
 
@@ -400,21 +546,40 @@ def _cluster_document(
     )
     sharded = kind == CLUSTER_TYPE_SHARDED
 
-    members = [_member_document(r, sharded=sharded) for r in records]
+    replica_set_sizes = Counter(r.replication_set for r in records if r.replication_set)
+    members = [
+        _member_document(r, sharded=sharded, replica_set_sizes=replica_set_sizes)
+        for r in records
+    ]
     members.sort(key=lambda m: m["service_name"])
     observed = [m for m in members if m["observed"]]
     observed_at = generated_at.isoformat() if observed else None
 
     versions, version_unavailable = _versions(members)
     unavailable: dict[str, str] = dict(version_unavailable)
-    # Neither is derivable from what the worker collects today; see §7 of the API
-    # plan for what would close each.
-    unavailable["max_replication_lag_seconds"] = (
-        REASON_METRIC_NOT_COLLECTED if observed else REASON_NOT_OBSERVED
-    )
-    unavailable["oplog_window_seconds"] = (
-        REASON_METRIC_NOT_COLLECTED if observed else REASON_NOT_OBSERVED
-    )
+
+    # The two aggregates differ, and the asymmetry is the point: the worst-lagging
+    # member is the cluster's exposure, while the *shortest* oplog is the binding
+    # constraint on resync and PITR -- a cluster is only as safe as its tightest oplog.
+    metrics_observed = any(r.metrics_observed for r in records)
+    max_lag = _aggregate(members, "replication_lag_seconds", max)
+    min_window = _aggregate(members, "oplog_window_seconds", min)
+    for field, value, applicable in (
+        (
+            "max_replication_lag_seconds",
+            max_lag,
+            any(_has_lag(r, replica_set_sizes) for r in records),
+        ),
+        (
+            "oplog_window_seconds",
+            min_window,
+            any(_has_oplog(r) for r in records),
+        ),
+    ):
+        if value is None:
+            unavailable[field] = _replication_reason(
+                metrics_observed=metrics_observed, applicable=applicable
+            )
 
     document: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -429,8 +594,8 @@ def _cluster_document(
         "members_observed": len(observed),
         "members_by_state": dict(Counter(m["state"] for m in observed if m["state"])),
         "versions": versions,
-        "max_replication_lag_seconds": None,
-        "oplog_window_seconds": None,
+        "max_replication_lag_seconds": max_lag,
+        "oplog_window_seconds": min_window,
         "last_seen": observed_at,
         "update": {"available": None, "reason": REASON_NO_VERSION_CATALOG},
         "unavailable": unavailable,

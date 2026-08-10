@@ -180,6 +180,11 @@ DEFAULT_PRECEDENCE: Mapping[str, tuple[str, ...]] = {
     "vendor": ("metrics",),
     "edition": ("metrics",),
     "endpoint": ("inventory",),
+    # Replication health. Metrics-only: no other source can supply any of them,
+    # and an unlisted source is forbidden from trying.
+    "replication_lag_seconds": ("metrics",),
+    "oplog_head_timestamp": ("metrics",),
+    "oplog_tail_timestamp": ("metrics",),
     "state": ("metrics", "probe"),
 }
 

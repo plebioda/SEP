@@ -453,6 +453,7 @@ def _node_records(rows: list[PomNode]) -> list[NodeRecord]:
             resolution=str(row.resolution),
             probe_status=str(row.probe_status),
             probe=row.probe,
+            facts=row.facts or {},
         )
         for row in rows
     ]
