@@ -45,8 +45,30 @@ NOW = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
 FRESH_AGE = 30.0
 STALE_AGE = 90_000.0
 
-#: The catalog reads two metrics, so a full collection costs two queries.
-CATALOG_QUERIES = 2
+
+def _expected_queries(signals=SIGNALS) -> int:
+    """Return the round trips a full collection of ``signals`` costs.
+
+    Derived rather than hardcoded so the catalog can grow without this file becoming a
+    tally to update: one ``lag()`` query per distinct metric, plus a ``last_over_time()``
+    query for each metric that carries at least one Value signal.
+    """
+    return sum(
+        1 + any(isinstance(sig.take, Value) for sig in group)
+        for group in by_metric(signals).values()
+    )
+
+
+#: Round trips one full collection costs, per batch.
+CATALOG_QUERIES = _expected_queries()
+
+#: One metric carrying one Value signal: its age query plus its value query.
+VALUE_SIGNAL_QUERIES = 2
+
+#: Expectations for the reducer fixtures.
+WORST_LAG = 9.0
+SOLO_LAG = 3.0
+UNREDUCED_SERIES = 2
 
 #: The default staleness threshold every collection in this module runs with.
 MAX_AGE = 300
@@ -224,9 +246,10 @@ class TestCollectMetricFacts:
         )
 
     async def test_one_query_per_metric_not_per_signal(self, pmm):
-        """Nine signals over two metrics cost two round trips, and must keep doing so."""
+        """Signals batch by metric: the cost tracks distinct metrics, never signals."""
         await _collect(pmm)
-        assert len(pmm.queries) == len(by_metric(SIGNALS)) == CATALOG_QUERIES
+        assert len(pmm.queries) == CATALOG_QUERIES
+        assert len(SIGNALS) > CATALOG_QUERIES
 
     async def test_collects_the_fields_the_document_needs(self, pmm):
         """Vendor and edition are the ones nothing else can supply."""
@@ -373,11 +396,16 @@ class TestSampleAgeSemantics:
         assert result.detail["stale_services"] == 1
 
     async def test_the_age_query_is_lag_not_timestamp(self):
-        """`timestamp(last_over_time(...))` must not come back."""
+        """`timestamp(last_over_time(...))` must not come back.
+
+        Value signals legitimately add `last_over_time()` queries of their own, so the
+        assertion is about `timestamp(` never appearing -- not about every query being
+        a `lag()`.
+        """
         pmm = FakePMM({})
         await _collect(pmm)
-        assert all(query.startswith("lag(") for query in pmm.queries)
         assert not any("timestamp(" in query for query in pmm.queries)
+        assert any(query.startswith("lag(") for query in pmm.queries)
 
 
 class TestValueSignals:
@@ -410,7 +438,8 @@ class TestValueSignals:
             batch_size=50,
             now=NOW,
         )
-        assert len(pmm.queries) == CATALOG_QUERIES
+        # One metric, one Value signal: the age query plus its own value query.
+        assert len(pmm.queries) == VALUE_SIGNAL_QUERIES
         assert any(q.startswith("lag(") for q in pmm.queries)
         assert any(q.startswith("last_over_time(") for q in pmm.queries)
 
@@ -430,3 +459,120 @@ class TestValueSignals:
             now=NOW,
         )
         assert [fact.value for fact in result.facts] == [1203]
+
+
+LAG = "mongodb_mongod_replset_member_replication_lag"
+
+
+def _lag_series(service_id: str, peer: str, value: float) -> dict:
+    """Build one replication-lag series -- there is one per (node, secondary peer)."""
+    return {
+        "metric": {"service_id": service_id, "member_idx": peer, "self": "0"},
+        "value": [1786137000, str(value)],
+    }
+
+
+class _FakePMMLag:
+    """Answer the lag metric's age and value queries from separate series lists."""
+
+    def __init__(self, ages: list[tuple[str, float]], values: list[tuple[str, float]]):
+        self.ages = ages
+        self.values = values
+        self.queries: list[str] = []
+
+    async def get(self, path: str, params: dict) -> dict:
+        """Return ages for the `lag()` query and values for `last_over_time()`."""
+        query = params["query"]
+        self.queries.append(query)
+        if LAG not in query:
+            return _payload()
+        source = self.ages if query.startswith("lag(") else self.values
+        return _payload(*(_lag_series(NODE00, peer, v) for peer, v in source))
+
+
+class TestSeriesReducer:
+    """Cover folding a multi-series metric into one fact per service.
+
+    Replication lag emits one series per (reporting node, secondary peer). Without a
+    reducer `merge_facts` keeps whichever arrived first, so the document would carry an
+    arbitrary peer's lag. That bug is near-invisible on an idle estate, where every
+    series reads the same number and the wrong answer looks right -- hence these tests
+    use deliberately *different* values per peer.
+    """
+
+    @staticmethod
+    async def _collect_lag(pmm):
+        """Collect only the replication group against ``pmm``."""
+        return await collect_metric_facts(
+            pmm,
+            [SERVICES[0]],
+            signals_for(["replication"]),
+            lookback="24h",
+            max_age_seconds=MAX_AGE,
+            batch_size=50,
+            now=NOW,
+        )
+
+    async def test_several_series_fold_to_one_fact(self):
+        """Three peers, one fact -- not three competing ones."""
+        pmm = _FakePMMLag(
+            ages=[("p0", 10.0), ("p1", 20.0), ("p2", 30.0)],
+            values=[("p0", 1.0), ("p1", 9.0), ("p2", 4.0)],
+        )
+        result = await self._collect_lag(pmm)
+        lag = [f for f in result.facts if f.field == "replication_lag_seconds"]
+        assert len(lag) == 1
+
+    async def test_the_reducer_picks_the_worst_lag(self):
+        """`max` is the reducer because the worst-lagging peer is the exposure."""
+        pmm = _FakePMMLag(
+            ages=[("p0", 10.0), ("p1", 20.0), ("p2", 30.0)],
+            values=[("p0", 1.0), ("p1", 9.0), ("p2", 4.0)],
+        )
+        result = await self._collect_lag(pmm)
+        lag = next(f for f in result.facts if f.field == "replication_lag_seconds")
+        assert lag.value == WORST_LAG
+
+    async def test_observed_at_belongs_to_the_winning_series(self):
+        """A fact must date the value it carries, not some other peer's sample.
+
+        The winning peer's sample is 20s old; the group spans 10s to 30s. Taking the
+        newest or the oldest would make staleness rules reason about a different sample
+        than the one whose number reached the document.
+        """
+        pmm = _FakePMMLag(
+            ages=[("p0", 10.0), ("p1", 20.0), ("p2", 30.0)],
+            values=[("p0", 1.0), ("p1", 9.0), ("p2", 4.0)],
+        )
+        result = await self._collect_lag(pmm)
+        lag = next(f for f in result.facts if f.field == "replication_lag_seconds")
+        assert lag.observed_at == NOW - timedelta(seconds=20)
+
+    async def test_a_single_series_still_yields_one_fact(self):
+        """A reducer must not require several series to work."""
+        pmm = _FakePMMLag(ages=[("p0", 10.0)], values=[("p0", 3.0)])
+        result = await self._collect_lag(pmm)
+        lag = [f for f in result.facts if f.field == "replication_lag_seconds"]
+        assert len(lag) == 1
+        assert lag[0].value == SOLO_LAG
+
+    async def test_a_signal_without_a_reducer_emits_one_fact_per_series(self):
+        """The unreduced path is unchanged: merge_facts still keeps the first.
+
+        This is what makes the reducer opt-in rather than a behaviour change for the
+        nine signals that legitimately see one series per service.
+        """
+        unreduced = Signal("replication_lag_seconds", LAG, Value(float), "replication")
+        pmm = _FakePMMLag(
+            ages=[("p0", 10.0), ("p1", 20.0)], values=[("p0", 1.0), ("p1", 9.0)]
+        )
+        result = await collect_metric_facts(
+            pmm,
+            [SERVICES[0]],
+            [unreduced],
+            lookback="24h",
+            max_age_seconds=MAX_AGE,
+            batch_size=50,
+            now=NOW,
+        )
+        assert len(result.facts) == UNREDUCED_SERIES

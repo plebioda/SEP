@@ -36,6 +36,8 @@ from app.sep.apps.pom_worker.projection import (
     HEALTH_UNKNOWN,
     HEALTH_WARNING,
     NodeRecord,
+    REASON_METRIC_NOT_COLLECTED,
+    REASON_NOT_APPLICABLE,
     REASON_NOT_OBSERVED,
 )
 
@@ -46,6 +48,13 @@ REPLICA_MEMBERS = 3
 #: Pairs in the fixtures that use two of something (config servers, shards,
 #: observed members, unobserved services).
 PAIR = 2
+
+#: Expected folds over the replication fixtures below.
+MAX_LAG = 9.0
+MEMBER_LAG = 3.0
+MIN_WINDOW = 500.0
+SOLO_WINDOW = 800.0
+LAG_ONLY_MEMBER = 7.0
 
 
 def probe(
@@ -82,6 +91,7 @@ def node(
     replication_set: str | None = "rs",
     port: int = 27017,
     observed: bool = True,
+    facts: dict | None = None,
     **kwargs,
 ) -> NodeRecord:
     """Build a node record for a projection case.
@@ -91,6 +101,7 @@ def node(
     :param replication_set: The replica set, or ``None`` for a mongos.
     :param port: The service port.
     :param observed: Whether the probe answered.
+    :param facts: Merged facts in the serialised shape; see :func:`metric_facts`.
     :param kwargs: Passed through to :func:`probe` when observed.
     :return: The node record.
     """
@@ -105,7 +116,24 @@ def node(
         resolution="NAME" if observed else "ORPHANED",
         probe_status="ok" if observed else "skipped",
         probe=probe(**kwargs) if observed else None,
+        facts=facts or {},
     )
+
+
+def metric_facts(**values: float) -> dict:
+    """Build merged facts as ``_apply_facts`` serialises them.
+
+    The serialised shape -- ``{field: {"value", "source", "observed_at"}}`` -- is what
+    the projection actually receives, and getting it wrong is the likeliest way to make
+    these tests pass against code that fails on real rows.
+
+    :param values: Field-to-value pairs, all attributed to the metrics source.
+    :return: The serialised facts.
+    """
+    return {
+        field: {"value": value, "source": "metrics", "observed_at": None}
+        for field, value in values.items()
+    }
 
 
 class TestClusterId:
@@ -337,3 +365,226 @@ class TestSummary:
         assert summary["clusters"] == PAIR
         assert summary["by_health"] == {HEALTH_OK: 1, HEALTH_UNKNOWN: 1}
         assert summary["by_type"] == {CLUSTER_TYPE_REPLICA_SET: PAIR}
+
+
+class TestReplicationFields:
+    """Cover replication lag and the oplog window, per member and per cluster.
+
+    These are the first fields sourced from VictoriaMetrics rather than the probe, so
+    they are also the cover for `NodeRecord.facts` reaching the projection at all.
+    """
+
+    def test_cluster_lag_is_the_worst_member(self) -> None:
+        """The worst-lagging member is the cluster's exposure, so `max` wins."""
+        documents = build_cluster_documents(
+            [
+                node("n0", facts=metric_facts(replication_lag_seconds=0.0)),
+                node("n1", facts=metric_facts(replication_lag_seconds=9.0)),
+                node("n2", facts=metric_facts(replication_lag_seconds=4.0)),
+            ],
+            GENERATED_AT,
+        )
+        assert documents[0]["max_replication_lag_seconds"] == MAX_LAG
+
+    def test_cluster_oplog_window_is_the_tightest_member(self) -> None:
+        """A cluster is only as safe as its shortest oplog, so `min` wins."""
+        documents = build_cluster_documents(
+            [
+                node(
+                    "n0",
+                    facts=metric_facts(
+                        oplog_head_timestamp=1500.0, oplog_tail_timestamp=1000.0
+                    ),
+                ),
+                node(
+                    "n1",
+                    facts=metric_facts(
+                        oplog_head_timestamp=1900.0, oplog_tail_timestamp=1000.0
+                    ),
+                ),
+            ],
+            GENERATED_AT,
+        )
+        assert documents[0]["oplog_window_seconds"] == MIN_WINDOW
+
+    def test_zero_lag_is_a_value_not_a_gap(self) -> None:
+        """The regression that matters most: an idle replica set reads 0, not "unknown".
+
+        Every guard in this file exists to keep "we do not know" apart from "it is
+        zero", and lag is the field where the two are most easily conflated -- a healthy
+        idle cluster legitimately reports 0 forever.
+        """
+        documents = build_cluster_documents(
+            [
+                node("n0", facts=metric_facts(replication_lag_seconds=0.0)),
+                node("n1", facts=metric_facts(replication_lag_seconds=0.0)),
+            ],
+            GENERATED_AT,
+        )
+        document = documents[0]
+        assert document["max_replication_lag_seconds"] == 0.0
+        assert "max_replication_lag_seconds" not in document["unavailable"]
+
+    def test_members_carry_their_own_readings(self) -> None:
+        """The detail page shows per-member values, so they must survive projection."""
+        documents = build_cluster_documents(
+            [
+                node(
+                    "n0",
+                    facts=metric_facts(
+                        replication_lag_seconds=3.0,
+                        oplog_head_timestamp=1500.0,
+                        oplog_tail_timestamp=1000.0,
+                    ),
+                ),
+                node("n1", facts=metric_facts(replication_lag_seconds=1.0)),
+            ],
+            GENERATED_AT,
+        )
+        member = documents[0]["members"][0]
+        assert member["replication_lag_seconds"] == MEMBER_LAG
+        assert member["oplog_window_seconds"] == MIN_WINDOW
+
+    def test_a_negative_window_is_rejected_as_unknown(self) -> None:
+        """`head < tail` means mismatched scrapes or clock skew, not a negative window.
+
+        Surfacing the negative would render as a blank cell rather than an em-dash, so
+        the null is both more honest and more legible.
+        """
+        documents = build_cluster_documents(
+            [
+                node(
+                    "n0",
+                    facts=metric_facts(
+                        oplog_head_timestamp=100.0, oplog_tail_timestamp=900.0
+                    ),
+                )
+            ],
+            GENERATED_AT,
+        )
+        document = documents[0]
+        assert document["oplog_window_seconds"] is None
+        assert (
+            document["unavailable"]["oplog_window_seconds"]
+            == REASON_METRIC_NOT_COLLECTED
+        )
+
+    def test_nulls_are_ignored_rather_than_folded_in(self) -> None:
+        """A member with no reading must not read as a perfectly caught-up one."""
+        documents = build_cluster_documents(
+            [
+                node("n0", facts=metric_facts(replication_lag_seconds=7.0)),
+                node("n1", facts=metric_facts(version=1.0)),
+            ],
+            GENERATED_AT,
+        )
+        assert documents[0]["max_replication_lag_seconds"] == LAG_ONLY_MEMBER
+
+
+class TestReplicationReasons:
+    """Cover the four reason branches for a null replication field."""
+
+    def test_standalone_is_not_applicable(self) -> None:
+        """No replica set, no oplog -- a fact about the estate, not a collection gap."""
+        documents = build_cluster_documents(
+            [node("s0", replication_set=None, facts=metric_facts(version=1.0))],
+            GENERATED_AT,
+        )
+        unavailable = documents[0]["unavailable"]
+        assert documents[0]["type"] == CLUSTER_TYPE_STANDALONE
+        assert unavailable["max_replication_lag_seconds"] == REASON_NOT_APPLICABLE
+        assert unavailable["oplog_window_seconds"] == REASON_NOT_APPLICABLE
+
+    def test_single_member_replica_set_has_an_oplog_but_no_lag(self) -> None:
+        """Lag is measured against the primary's optime, so a lone member has no peer."""
+        documents = build_cluster_documents(
+            [
+                node(
+                    "g0",
+                    facts=metric_facts(
+                        oplog_head_timestamp=900.0, oplog_tail_timestamp=100.0
+                    ),
+                )
+            ],
+            GENERATED_AT,
+        )
+        document = documents[0]
+        assert document["oplog_window_seconds"] == SOLO_WINDOW
+        assert (
+            document["unavailable"]["max_replication_lag_seconds"]
+            == REASON_NOT_APPLICABLE
+        )
+        assert "oplog_window_seconds" not in document["unavailable"]
+
+    def test_a_service_metrics_never_saw_is_not_observed(self) -> None:
+        """Absence of evidence outranks a topology claim resting on inventory alone."""
+        documents = build_cluster_documents([node("u0", observed=False)], GENERATED_AT)
+        unavailable = documents[0]["unavailable"]
+        assert unavailable["max_replication_lag_seconds"] == REASON_NOT_OBSERVED
+        assert unavailable["oplog_window_seconds"] == REASON_NOT_OBSERVED
+
+    def test_covered_but_missing_is_a_collection_gap(self) -> None:
+        """Metrics saw the service; the field simply did not arrive."""
+        documents = build_cluster_documents(
+            [
+                node("n0", facts=metric_facts(version=1.0)),
+                node("n1", facts=metric_facts(version=1.0)),
+            ],
+            GENERATED_AT,
+        )
+        unavailable = documents[0]["unavailable"]
+        assert unavailable["max_replication_lag_seconds"] == REASON_METRIC_NOT_COLLECTED
+        assert unavailable["oplog_window_seconds"] == REASON_METRIC_NOT_COLLECTED
+
+    def test_a_mongos_is_not_applicable_for_either(self) -> None:
+        """A router has no replica set, so neither field is meaningful for it."""
+        documents = build_cluster_documents(
+            [
+                node(
+                    "cfg0",
+                    replication_set="cfg",
+                    port=27019,
+                    facts=metric_facts(version=1.0),
+                ),
+                node(
+                    "shard0",
+                    replication_set="sh",
+                    port=27018,
+                    facts=metric_facts(version=1.0),
+                ),
+                node("mongos0", replication_set=None, facts=metric_facts(version=1.0)),
+            ],
+            GENERATED_AT,
+        )
+        router = next(
+            m for m in documents[0]["members"] if m["service_name"] == "mongos0"
+        )
+        assert router["unavailable"]["oplog_window_seconds"] == REASON_NOT_APPLICABLE
+        assert router["unavailable"]["replication_lag_seconds"] == REASON_NOT_APPLICABLE
+
+
+class TestMetricsObserved:
+    """Cover the distinction that keeps a monitored-but-unprobeable service honest."""
+
+    def test_metrics_only_service_is_metrics_observed_but_not_observed(self) -> None:
+        """The majority case at fleet scale: VM sees it, Nomad cannot reach it.
+
+        Reusing `observed` for metric reason codes would report `service_not_observed`
+        for a service VictoriaMetrics describes perfectly well.
+        """
+        record = node("n0", observed=False, facts=metric_facts(version=1.0))
+        assert not record.observed
+        assert record.metrics_observed
+
+    def test_probe_only_service_is_not_metrics_observed(self) -> None:
+        """A probe-sourced fact must not be mistaken for metrics coverage."""
+        record = node(
+            "n0",
+            facts={"version": {"value": "7.0", "source": "probe", "observed_at": None}},
+        )
+        assert record.observed
+        assert not record.metrics_observed
+
+    def test_a_record_with_no_facts_is_neither(self) -> None:
+        """The default keeps every existing construction of NodeRecord working."""
+        assert not node("n0", observed=False).metrics_observed

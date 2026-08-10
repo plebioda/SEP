@@ -233,6 +233,9 @@ def _read_batch(
     covered: set[str] = set()
     stale: set[str] = set()
     oldest_age: float | None = None
+    # Candidates for reducing signals, buffered across the series loop because the fold
+    # can only run once every series for a service has been seen.
+    pending: dict[tuple[str, str], list[tuple[Any, datetime]]] = {}
 
     values = {
         _join_key(labels): value for labels, value in parse_series(value_payload or {})
@@ -255,6 +258,11 @@ def _read_batch(
             value = signal.take.extract(labels, sample_value)
             if value is None or value == "":
                 continue
+            if signal.reduce is not None:
+                pending.setdefault((service.key, signal.field), []).append(
+                    (value, observed_at)
+                )
+                continue
             facts.append(
                 Fact(
                     service=service.key,
@@ -265,7 +273,53 @@ def _read_batch(
                 )
             )
 
+    facts.extend(_reduced_facts(pending, signals))
     return facts, covered, stale, oldest_age
+
+
+def _reduced_facts(
+    pending: dict[tuple[str, str], list[tuple[Any, datetime]]],
+    signals: Sequence[Signal],
+) -> list[Fact]:
+    """Fold each reducing signal's buffered series into one fact per service.
+
+    The emitted ``observed_at`` is the winning series' own, not the newest or the oldest
+    of the group: a fact must be able to say when *the value it carries* was observed,
+    or the staleness rules downstream would be reasoning about a different sample.
+
+    :param pending: Buffered ``(value, observed_at)`` per ``(service, field)``.
+    :param signals: The signals read from this metric, for their reducers.
+    :return: One fact per buffered ``(service, field)``.
+    """
+    reducers = {s.field: s.reduce for s in signals if s.reduce is not None}
+    facts: list[Fact] = []
+    for (service, field), candidates in pending.items():
+        reduce = reducers.get(field)
+        if reduce is None or not candidates:
+            continue
+        try:
+            winner = reduce([value for value, _ in candidates])
+        except (TypeError, ValueError) as err:  # a reducer must not fail the run
+            logger.warning(
+                "POM discovery: reducing %s for service %s failed: %s",
+                field,
+                service,
+                err,
+            )
+            continue
+        observed_at = next(
+            (at for value, at in candidates if value == winner), candidates[0][1]
+        )
+        facts.append(
+            Fact(
+                service=service,
+                field=field,
+                value=winner,
+                source=SOURCE_KEY,
+                observed_at=observed_at,
+            )
+        )
+    return facts
 
 
 async def collect_metric_facts(

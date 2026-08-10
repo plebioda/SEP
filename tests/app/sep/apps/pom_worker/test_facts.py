@@ -20,6 +20,8 @@ Pure -- no database, no HTTP client, no SEP fixtures.
 
 from datetime import datetime, UTC
 
+import pytest
+
 from app.sep.apps.pom_worker.fact_sources import inventory_facts, probe_facts
 from app.sep.apps.pom_worker.facts import (
     DEFAULT_PRECEDENCE,
@@ -37,6 +39,9 @@ OBSERVED = datetime(2026, 8, 7, 12, 0, tzinfo=UTC)
 #: Sandbox-shaped counts, named so assertions read as intent rather than magic.
 UNRESOLVED_SOME = 2
 UNRESOLVED_ALL = 14
+
+#: The value the replication precedence fixtures assert on.
+ACCEPTED_VALUE = 5.0
 
 
 def _result(source: str, *facts: Fact) -> SourceResult:
@@ -319,3 +324,42 @@ class TestProbeStatusSemantics:
     def test_all_answered_and_none_unresolved_is_ok(self):
         """Full coverage."""
         assert probe_facts({"7": self.RECORD}).status is SourceStatus.OK
+
+
+class TestReplicationPrecedence:
+    """Cover the replication fields, which only VictoriaMetrics can supply."""
+
+    @pytest.mark.parametrize(
+        "field",
+        ["replication_lag_seconds", "oplog_head_timestamp", "oplog_tail_timestamp"],
+    )
+    def test_only_metrics_may_supply_them(self, field):
+        """No probe or inventory value may reach these fields.
+
+        The probe has no concept of any of them, so a value arriving from either source
+        would be fabricated -- and a fabricated zero lag is indistinguishable on screen
+        from a healthy one.
+        """
+        merged = merge_facts(
+            [
+                _result("probe", Fact("7", field, 99.0, "probe")),
+                _result("inventory", Fact("7", field, 99.0, "inventory")),
+            ]
+        )
+        assert field not in merged.get("7", {})
+
+    @pytest.mark.parametrize(
+        "field",
+        ["replication_lag_seconds", "oplog_head_timestamp", "oplog_tail_timestamp"],
+    )
+    def test_a_metrics_value_is_accepted(self, field):
+        """The declared owner still wins normally."""
+        merged = merge_facts([_result("metrics", Fact("7", field, 5.0, "metrics"))])
+        assert merged["7"][field].value == ACCEPTED_VALUE
+
+    def test_zero_lag_survives_the_merge(self):
+        """`0` is a real reading; the presence rule must not drop it."""
+        merged = merge_facts(
+            [_result("metrics", Fact("7", "replication_lag_seconds", 0.0, "metrics"))]
+        )
+        assert merged["7"]["replication_lag_seconds"].value == 0.0
