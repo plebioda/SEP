@@ -1,0 +1,72 @@
+# Copyright (C) 2026 Percona LLC
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+"""Define the POM worker settings section.
+
+Read straight off YAML/env under ``SEP.POM_WORKER`` rather than mounted as a field
+on ``SEPSettings``, for the same reason ``atw`` does it: importing this module runs
+the package ``__init__``, which pulls in the app definition and transitively
+``sep_settings``, so a field default typed with this class would cycle while
+``SEPSettings`` is still under construction. Consumers import :data:`pom_worker_settings`
+at call time.
+"""
+
+__all__ = ["PomWorkerSettings", "pom_worker_settings"]
+
+from typing import ClassVar
+
+from pydantic import PositiveInt
+
+from app.core.config import BaseYamlSettings
+
+
+class PomWorkerSettings(BaseYamlSettings):
+    """Configure the POM worker collection job.
+
+    :cvar SETTINGS_PREFIXES: Places this section under ``SEP.POM_WORKER``.
+    :param EMIT_METRICS: Master switch for VictoriaMetrics emission. When false the
+        job still maps and probes and persists to Postgres, and writes nothing to VM.
+    :param EMIT_RAW_JSON: Whether to additionally emit the chunked
+        ``pom_result`` series carrying the raw probe JSON. Requires
+        ``EMIT_METRICS``; kept separate because it is the expensive, high-cardinality
+        one and is only useful for eyeballing a run in vmui.
+    :param PROBE_DATABASE: Whether the payload connects to mongod and runs database
+        commands. False collects process and OS facts only, which needs no
+        credentials.
+    :param CREDENTIALS_PATH: Node-side file holding the MongoDB URI to take
+        credentials from. ``None`` lets the payload fall back to ``~/.mongodb_uri``,
+        the same file the PBM payloads read.
+    :param CONNECT_TIMEOUT: Per-target connect and server-selection timeout, seconds.
+    :param TASK_TIMEOUT: How long to wait for one dispatched probe task to reach a
+        terminal status before giving up on it, seconds.
+    :param POLL_INTERVAL: Delay between task-status polls, seconds.
+    :param MAX_CONCURRENT_PROBES: Ceiling on probe tasks in flight at once. The
+        sandbox has 12 executors; a real estate has many more, and every dispatch is
+        a Nomad job.
+    """
+
+    SETTINGS_PREFIXES: ClassVar[list[str]] = ["SEP", "POM_WORKER"]
+
+    EMIT_METRICS: bool = False
+    EMIT_RAW_JSON: bool = False
+    PROBE_DATABASE: bool = True
+    CREDENTIALS_PATH: str | None = None
+    CONNECT_TIMEOUT: PositiveInt = 5
+    TASK_TIMEOUT: PositiveInt = 180
+    POLL_INTERVAL: PositiveInt = 3
+    MAX_CONCURRENT_PROBES: PositiveInt = 8
+
+
+pom_worker_settings: PomWorkerSettings = PomWorkerSettings()
