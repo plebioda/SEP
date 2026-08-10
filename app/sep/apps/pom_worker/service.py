@@ -31,6 +31,7 @@ embedded PostgreSQL.
 
 import logging
 from typing import Any
+from urllib.parse import urlparse
 from uuid import UUID
 
 from app.core.config import settings
@@ -45,13 +46,31 @@ from app.sep.apps.pom_worker.crud import (
     PomRunManager,
 )
 from app.sep.apps.pom_worker.dispatch import HostProbeResult, probe_all
-from app.sep.apps.pom_worker.inventory import list_mongodb_services
+from app.sep.apps.pom_worker.fact_sources import (
+    inventory_facts,
+    probe_facts,
+    service_keys,
+)
+from app.sep.apps.pom_worker.facts import (
+    merge_facts,
+    MergedField,
+    SourceResult,
+    SourceStatus,
+)
+from app.sep.apps.pom_worker.inventory import InventoryService, list_mongodb_services
 from app.sep.apps.pom_worker.mapping import (
     get_executor_hosts,
     map_services,
     MappedService,
 )
 from app.sep.apps.pom_worker.metrics import build_exposition, emit, node_labels
+from app.sep.apps.pom_worker.metrics_catalog import signals_for
+from app.sep.apps.pom_worker.metrics_source import (
+    collect_metric_facts,
+)
+from app.sep.apps.pom_worker.metrics_source import (
+    SOURCE_KEY as METRICS_SOURCE_KEY,
+)
 from app.sep.apps.pom_worker.models import (
     NodeResolution,
     PomCluster,
@@ -67,6 +86,18 @@ from app.sep.deps import get_pmm_api
 from app.tasks.config import tasks_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _origin_node() -> str | None:
+    """Return the PMM host this snapshot was taken from.
+
+    The document names its own vantage point, so a snapshot moved between environments
+    still says where it came from.
+
+    :return: The configured PMM endpoint's host, or ``None`` when PMM is unconfigured.
+    """
+    endpoint = settings.PMM.endpoint
+    return urlparse(str(endpoint)).hostname if endpoint else None
 
 
 async def _build_clients() -> tuple[RemoteAPI, RemoteAPI]:
@@ -154,7 +185,7 @@ async def run_discovery(execution_id: UUID | None = None) -> UUID:
 
     # The probe phase can take minutes, so the session is not held across it.
     try:
-        rows, host_results, mapped = await _collect(execution_id)
+        rows, host_results, mapped, sources = await _collect(execution_id)
     except Exception as err:
         logger.exception("POM worker: run %s failed", execution_id)
         async with session_maker() as session:
@@ -194,18 +225,17 @@ async def run_discovery(execution_id: UUID | None = None) -> UUID:
             ),
         )
         finished = await PomRunManager.get(session, id=execution_id)
-        finished.status = (
-            PomRunStatus.SUCCESS
-            if resolved and probes_ok == resolved
-            else PomRunStatus.PARTIAL
-            if probes_ok
-            else PomRunStatus.FAILED
-        )
+        finished.status = _run_status(sources)
         finished.finished_at = utc_now()
         finished.services_total = len(mapped)
         finished.services_resolved = resolved
         finished.services_orphaned = orphaned
         finished.probes_ok = probes_ok
+        finished.origin_node = _origin_node()
+        finished.sources = {
+            key: {"status": str(result.status), **result.detail}
+            for key, result in sources.items()
+        }
         await PomRunManager.save(session, finished)
 
     logger.info(
@@ -224,11 +254,17 @@ async def run_discovery(execution_id: UUID | None = None) -> UUID:
 
 async def _collect(
     execution_id: UUID,
-) -> tuple[list[PomNode], dict[str, HostProbeResult], list[MappedService]]:
+) -> tuple[
+    list[PomNode],
+    dict[str, HostProbeResult],
+    list[MappedService],
+    dict[str, SourceResult],
+]:
     """Run steps 1-3 and assemble the rows to persist.
 
     :param execution_id: The owning run's id.
-    :return: The rows to persist, the per-host probe results, and the mapping.
+    :return: The rows to persist, the per-host probe results, the mapping, and each
+        source's result keyed by source.
     """
     inventory_api, tasks_api = await _build_clients()
 
@@ -241,7 +277,11 @@ async def _collect(
         services = await list_mongodb_services(inventory_api)
         executor_hosts = await get_executor_hosts(tasks_api)
         mapped = map_services(services, executor_hosts)
-        host_results = await probe_all(tasks_api, mapped)
+        host_results = (
+            await probe_all(tasks_api, mapped)
+            if "probe" in pom_worker_settings.SOURCES
+            else {}
+        )
 
     rows = []
     for entry in mapped:
@@ -265,7 +305,131 @@ async def _collect(
                 error=error,
             )
         )
-    return rows, host_results, mapped
+
+    sources = await _collect_facts(services, rows)
+    _apply_facts(rows, sources)
+    return rows, host_results, mapped, sources
+
+
+async def _collect_facts(
+    services: list[InventoryService], rows: list[PomNode]
+) -> dict[str, SourceResult]:
+    """Gather every enabled source's facts about this run's services.
+
+    Each source is independent: one that is switched off, or that fails outright, costs
+    the run the fields only it could supply and nothing else. That is why the metrics
+    source's failure is caught here rather than allowed to abort -- a snapshot with no
+    versions but a correct service list is still worth having, and
+    ``pom_run.sources`` says plainly which it is.
+
+    :param services: The inventory services this run covers.
+    :param rows: The already-built node rows, carrying each service's probe record.
+    :return: Each source's result, keyed by source.
+    """
+    enabled = set(pom_worker_settings.SOURCES)
+    results: dict[str, SourceResult] = {"inventory": inventory_facts(services)}
+
+    if "probe" in enabled:
+        attempted = [
+            row
+            for row in rows
+            if row.service_id is not None
+            and row.probe_status is not ProbeStatus.SKIPPED
+        ]
+        results["probe"] = probe_facts(
+            {str(row.service_id): row.probe for row in attempted},
+            unresolved=len(rows) - len(attempted),
+        )
+
+    if METRICS_SOURCE_KEY in enabled:
+        results[METRICS_SOURCE_KEY] = await _collect_metrics(services)
+
+    return results
+
+
+async def _collect_metrics(services: list[InventoryService]) -> SourceResult:
+    """Query VictoriaMetrics for the catalog's signals.
+
+    :param services: The inventory services this run covers.
+    :return: The metrics source's result, ``FAILED`` when VM could not be reached.
+    """
+    pmm_api = await get_pmm_api()
+    if pmm_api is None:
+        logger.warning(
+            "POM discovery: no PMM client configured; VictoriaMetrics is unreachable "
+            "and this run has no versions, vendor or edition."
+        )
+        return SourceResult(
+            METRICS_SOURCE_KEY,
+            SourceStatus.FAILED,
+            (),
+            {"errors": ["no PMM client configured"]},
+        )
+
+    signals = signals_for(pom_worker_settings.METRICS_GROUPS)
+    return await collect_metric_facts(
+        pmm_api,
+        service_keys(services),
+        signals,
+        lookback=pom_worker_settings.METRICS_LOOKBACK,
+        max_age_seconds=pom_worker_settings.METRICS_MAX_AGE,
+        batch_size=pom_worker_settings.METRICS_QUERY_BATCH,
+    )
+
+
+def _run_status(sources: dict[str, SourceResult]) -> PomRunStatus:
+    """Grade the run on what its sources achieved, not on the probe alone.
+
+    Discovery has three sources and the probe is the one least likely to reach anything
+    -- it needs a healthy Nomad ``raw_exec`` executor, where the metrics source needs
+    only a running pmm-agent. Grading the run on probe coverage reported ``FAILED`` for
+    runs that had just collected a complete and correct picture of the estate from
+    VictoriaMetrics, which is both wrong and the opposite of useful.
+
+    :param sources: Each enabled source's result.
+    :return: The run's terminal status.
+    """
+    graded = [
+        result.status
+        for result in sources.values()
+        if result.status is not SourceStatus.DISABLED
+    ]
+    if not graded or all(status is SourceStatus.FAILED for status in graded):
+        return PomRunStatus.FAILED
+    if all(status is SourceStatus.OK for status in graded):
+        return PomRunStatus.SUCCESS
+    return PomRunStatus.PARTIAL
+
+
+def _serialise(merged: dict[str, MergedField]) -> dict[str, Any]:
+    """Render one service's merged fields JSON-safe, keeping provenance.
+
+    :param merged: The service's merged fields.
+    :return: ``{field: {value, source, observed_at}}``.
+    """
+    return {
+        field: {
+            "value": item.value,
+            "source": item.source,
+            "observed_at": (
+                item.observed_at.isoformat() if item.observed_at is not None else None
+            ),
+        }
+        for field, item in merged.items()
+    }
+
+
+def _apply_facts(rows: list[PomNode], sources: dict[str, SourceResult]) -> None:
+    """Merge every source's facts and write the result onto each node row.
+
+    :param rows: The run's node rows, mutated in place.
+    :param sources: Each source's result.
+    """
+    merged = merge_facts(sources.values())
+    for row in rows:
+        if row.service_id is None:
+            continue
+        row.facts = _serialise(merged.get(str(row.service_id), {})) or None
 
 
 def _node_records(rows: list[PomNode]) -> list[NodeRecord]:

@@ -38,6 +38,13 @@ class InventoryService:
     must group on ``replication_set``.
 
     :param service_id: The inventory service id.
+    :param external_id: **PMM's** service UUID, which inventory stores as
+        ``external_id``. This is the join key against VictoriaMetrics, whose
+        ``service_id`` label carries the same UUID -- and it is the *only* safe one:
+        ``service_name`` is reused across re-registrations while the superseded series
+        live on until retention expires, so a name-keyed join silently mixes
+        generations. ``None`` when inventory carries none, which makes the service
+        invisible to the metrics source.
     :param name: The inventory service name.
     :param port: The service port, defaulted when inventory carries none.
     :param cluster: The service's cluster attribute, if any.
@@ -48,6 +55,7 @@ class InventoryService:
     """
 
     service_id: int | None
+    external_id: str | None
     name: str
     port: int
     cluster: str | None
@@ -78,6 +86,7 @@ def _service_from_entry(entry: dict) -> InventoryService | None:
         return None
     return InventoryService(
         service_id=entry.get("id"),
+        external_id=entry.get("external_id") or None,
         name=entry.get("name") or node_name or node_address or "",
         port=entry.get("port") or DEFAULT_MONGODB_PORT,
         cluster=entry.get("cluster") or None,
