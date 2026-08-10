@@ -142,6 +142,18 @@ def cluster_id(
     return f"cl_{digest[:8]}"
 
 
+def member_state_name(state: int | None) -> str | None:
+    """Return the name of a ``replSetGetStatus.myState`` value.
+
+    :param state: The numeric member state, or ``None``.
+    :return: The state name, ``STATE_<n>`` for an unrecognised value, or ``None`` when
+        no state was reported -- a mongos and a standalone both report none.
+    """
+    if state is None:
+        return None
+    return _MEMBER_STATES.get(state, f"STATE_{state}")
+
+
 def _member_state(record: NodeRecord) -> str | None:
     """Return a member's replica-set state name, when the probe reported one.
 
@@ -149,10 +161,7 @@ def _member_state(record: NodeRecord) -> str | None:
     :return: The state name, or ``None`` when unobserved or not in a replica set.
     """
     database = (record.probe or {}).get("database") or {}
-    state = database.get("state")
-    if state is None:
-        return None
-    return _MEMBER_STATES.get(state, f"STATE_{state}")
+    return member_state_name(database.get("state"))
 
 
 def _sharded_role(record: NodeRecord) -> str:

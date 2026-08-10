@@ -48,6 +48,7 @@ def make_service(
     """
     return InventoryService(
         service_id=1,
+        external_id="ff0275b6-3633-474a-8068-3c39d3c7a4da",
         name=name,
         port=27017,
         cluster="c",

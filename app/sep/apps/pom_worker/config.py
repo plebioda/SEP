@@ -55,6 +55,26 @@ class PomWorkerSettings(BaseYamlSettings):
     :param MAX_CONCURRENT_PROBES: Ceiling on probe tasks in flight at once. The
         sandbox has 12 executors; a real estate has many more, and every dispatch is
         a Nomad job.
+    :param SOURCES: Which discovery sources run. Dropping ``probe`` yields a complete
+        status document with **no Nomad dependency at all** -- worth knowing, because
+        the probe reaches only services with a healthy ``raw_exec`` executor while the
+        metrics source reaches every service PMM monitors, which in this workspace is
+        1 against 38.
+    :param METRICS_GROUPS: Which groups of
+        :data:`~app.sep.apps.pom_worker.metrics_catalog.SIGNALS` are collected. One
+        query is issued per distinct metric across the enabled groups, so this is a
+        cost dial as well as a content one.
+    :param METRICS_LOOKBACK: The ``last_over_time`` window wrapped around every query.
+        Instant queries look back only five minutes, so an unwrapped query returns
+        nothing whenever scraping paused; this is what stops that reading as "no such
+        service".
+    :param METRICS_MAX_AGE: Seconds beyond which a sample is *counted* stale on the
+        run. Deliberately not a filter -- stale facts are kept, with their age, because
+        discarding them erases the difference between "this service is gone" and "this
+        service has not been scraped since Tuesday".
+    :param METRICS_QUERY_BATCH: Services pinned per query. Each contributes a 37-byte
+        UUID to a regex matcher, so this bounds the query string rather than the
+        result set.
     """
 
     SETTINGS_PREFIXES: ClassVar[list[str]] = ["SEP", "POM_WORKER"]
@@ -67,6 +87,11 @@ class PomWorkerSettings(BaseYamlSettings):
     TASK_TIMEOUT: PositiveInt = 180
     POLL_INTERVAL: PositiveInt = 3
     MAX_CONCURRENT_PROBES: PositiveInt = 8
+    SOURCES: list[str] = ["inventory", "metrics", "probe"]
+    METRICS_GROUPS: list[str] = ["identity", "rs_status"]
+    METRICS_LOOKBACK: str = "24h"
+    METRICS_MAX_AGE: PositiveInt = 300
+    METRICS_QUERY_BATCH: PositiveInt = 50
 
 
 pom_worker_settings: PomWorkerSettings = PomWorkerSettings()

@@ -100,6 +100,12 @@ class PomRun(BaseUUIDSQLModel, table=True):
     :param services_resolved: Services mapped to a live executor host.
     :param services_orphaned: Services with no live executor host.
     :param probes_ok: Services that returned a usable probe record.
+    :param origin_node: The PMM node this snapshot was taken from, recorded so a
+        document can name its own vantage point.
+    :param sources: Per-source status and counters -- each
+        :class:`~app.sep.apps.pom_worker.facts.SourceResult`'s ``detail``, keyed by
+        source. This is the run's receipt: it is what makes a thin snapshot legible as
+        "the probe could not reach anything" rather than merely thin.
     :param error: The failure detail when the run itself raised.
     """
 
@@ -123,6 +129,19 @@ class PomRun(BaseUUIDSQLModel, table=True):
     services_resolved: int = SQLField(default=0)
     services_orphaned: int = SQLField(default=0)
     probes_ok: int = SQLField(default=0)
+    origin_node: str | None = SQLField(default=None)
+    # Explicit variant rather than ``AutoJSON`` for the reason spelled out on
+    # ``PomNode.probe`` below: ``AutoJSON`` silently drops ``none_as_null`` on
+    # PostgreSQL, so a Python ``None`` lands as the JSON scalar ``null``.
+    sources: dict[str, Any] | None = SQLField(
+        default=None,
+        sa_column=Column(
+            JSON(none_as_null=True).with_variant(
+                postgresql.JSONB(none_as_null=True), "postgresql"
+            ),
+            nullable=True,
+        ),
+    )
     error: str | None = SQLField(default=None)
 
 
@@ -152,6 +171,10 @@ class PomNode(BaseSQLModel, table=True):
         failures can be traced into the Tasks API and Nomad without re-deriving
         which dispatch covered which service.
     :param probe: The payload's full record for this service.
+    :param facts: The merged field mapping for this service -- every field the run
+        settled on, each with the source that supplied it and when it was observed.
+        Beside ``probe`` rather than replacing it: ``probe`` is one source's raw output,
+        ``facts`` is the reconciled answer across all of them.
     :param error: The per-service failure detail.
     """
 
@@ -194,6 +217,15 @@ class PomNode(BaseSQLModel, table=True):
     # explicit variant keeps it on both dialects and still yields JSONB on
     # PostgreSQL, matching the migration.
     probe: dict[str, Any] | None = SQLField(
+        default=None,
+        sa_column=Column(
+            JSON(none_as_null=True).with_variant(
+                postgresql.JSONB(none_as_null=True), "postgresql"
+            ),
+            nullable=True,
+        ),
+    )
+    facts: dict[str, Any] | None = SQLField(
         default=None,
         sa_column=Column(
             JSON(none_as_null=True).with_variant(
