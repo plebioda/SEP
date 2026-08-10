@@ -155,6 +155,8 @@ class PomNode(BaseSQLModel, table=True):
     :param run_id: The owning :class:`PomRun`.
     :param service_name: The inventory service name.
     :param service_id: The inventory service id.
+    :param external_id: PMM's service UUID. Stored because the document publishes
+        it as ``service_id`` and the metrics join keys on it.
     :param cluster: The service's ``cluster`` attribute; groups a sharded cluster.
     :param environment: The service's environment label, a filter and display tag.
     :param replication_set: The service's ``replication_set``; empty for mongos.
@@ -184,6 +186,7 @@ class PomNode(BaseSQLModel, table=True):
     run_id: UUID = SQLField(foreign_key="pom_run.id", index=True)
     service_name: str = SQLField(index=True)
     service_id: int | None = SQLField(default=None)
+    external_id: str | None = SQLField(default=None, index=True)
     cluster: str | None = SQLField(default=None, index=True)
     replication_set: str | None = SQLField(default=None, index=True)
     environment: str | None = SQLField(default=None, index=True)
@@ -237,43 +240,24 @@ class PomNode(BaseSQLModel, table=True):
     error: str | None = SQLField(default=None)
 
 
-class PomCluster(BaseSQLModel, table=True):
-    """Hold one cluster's assembled status document for one run.
+class PomSnapshot(BaseSQLModel, table=True):
+    """Hold one run's complete topology document.
 
-    The worker folds a run's per-service rows into these once; the API serves them
-    almost verbatim. Storing the assembled document rather than rebuilding it per
-    request is what makes the read path a keyed lookup instead of a join plus a
-    regrouping.
+    One row per run, not one per cluster: the document is a single nested
+    ``environments -> clusters -> services`` tree and the API serves it whole, so
+    splitting it would only mean reassembling it on every read.
 
-    One row per cluster per run — not one row per run — because the API's common
-    reads are "every cluster in the latest snapshot" and "this one cluster", and the
-    second is a keyed lookup only if clusters are rows.
+    It lives in its own table rather than as a column on :class:`PomRun` so that
+    listing run history stays cheap -- a run list would otherwise drag every document
+    it touches through the session.
 
-    :param run_id: The owning :class:`PomRun`.
-    :param cluster_id: The stable opaque id, derived from
-        ``(environment, cluster, replication_set)``. Stable across runs, so the
-        frontend can hold a URL.
-    :param name: The cluster label, for display and sorting.
-    :param cluster_type: ``replica_set`` / ``sharded_cluster`` / ``standalone``.
-    :param environment: The environment label, a first-class filter.
-    :param health_status: The rolled-up verdict, promoted out of the document so
-        filtering and grouping do not need a JSON path.
-    :param members_total: Services in the cluster.
-    :param members_observed: …of which answered a probe.
-    :param document: The complete status document the API returns.
+    :param run_id: The owning :class:`PomRun`; one snapshot per run.
+    :param document: The complete topology document the API returns.
     """
 
-    __tablename__ = "pom_cluster"
-    __table_args__ = (Index("ix_pom_cluster_run_cluster", "run_id", "cluster_id"),)
+    __tablename__ = "pom_snapshot"
 
-    run_id: UUID = SQLField(foreign_key="pom_run.id", index=True)
-    cluster_id: str = SQLField(index=True)
-    name: str = SQLField(index=True)
-    cluster_type: str = SQLField(index=True)
-    environment: str | None = SQLField(default=None, index=True)
-    health_status: str = SQLField(index=True)
-    members_total: int = SQLField(default=0)
-    members_observed: int = SQLField(default=0)
+    run_id: UUID = SQLField(foreign_key="pom_run.id", index=True, unique=True)
     # Non-nullable, so the AutoJSON/none_as_null trap cannot apply here at all.
     document: dict[str, Any] = SQLField(
         sa_column=Column(

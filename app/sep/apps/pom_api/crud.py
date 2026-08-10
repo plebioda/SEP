@@ -29,7 +29,7 @@ from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlmodel import select
 
-from app.sep.apps.pom_worker.models import PomCluster, PomRun, PomRunStatus
+from app.sep.apps.pom_worker.models import PomRun, PomRunStatus, PomSnapshot
 
 #: Run states whose snapshot a reader may see. ``FAILED`` is included deliberately:
 #: a failed run still recorded which services exist and that none could be reached,
@@ -52,36 +52,15 @@ async def latest_snapshot_run(session: AsyncSession) -> PomRun | None:
     return result.first()
 
 
-async def clusters_for_run(session: AsyncSession, run_id: UUID) -> list[PomCluster]:
-    """Return every cluster belonging to one run, ordered by name.
+async def snapshot_for_run(session: AsyncSession, run_id: UUID) -> PomSnapshot | None:
+    """Return one run's topology document.
 
     :param session: The database session.
     :param run_id: The run whose snapshot to read.
-    :return: The cluster rows.
+    :return: The snapshot row, or ``None`` when the run wrote none.
     """
     result = await session.exec(
-        select(PomCluster).where(PomCluster.run_id == run_id).order_by(PomCluster.name)  # type: ignore[arg-type]
-    )
-    return list(result.all())
-
-
-async def cluster_for_run(
-    session: AsyncSession, run_id: UUID, cluster_id: str
-) -> PomCluster | None:
-    """Return one cluster from a run's snapshot.
-
-    A keyed lookup rather than a JSON path extraction, which is why the worker
-    stores one row per cluster rather than one document per run.
-
-    :param session: The database session.
-    :param run_id: The run whose snapshot to read.
-    :param cluster_id: The opaque cluster id.
-    :return: The cluster row, or ``None`` when the snapshot has no such cluster.
-    """
-    result = await session.exec(
-        select(PomCluster).where(
-            PomCluster.run_id == run_id, PomCluster.cluster_id == cluster_id
-        )
+        select(PomSnapshot).where(PomSnapshot.run_id == run_id)  # type: ignore[arg-type]
     )
     return result.first()
 

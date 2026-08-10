@@ -31,7 +31,6 @@ Two rules of the topology contract show up directly here:
 """
 
 from datetime import datetime
-from typing import Any
 from uuid import UUID
 
 from pydantic import BaseModel, Field
@@ -55,86 +54,111 @@ class SnapshotEnvelope(BaseModel):
     run_id: UUID
 
 
-class HealthSummary(BaseModel):
-    """Count clusters and services across the whole snapshot.
+class TopologyService(BaseModel):
+    """One monitored MongoDB service, as the topology document records it.
 
-    :param clusters: Clusters in the snapshot.
-    :param by_health: Cluster counts keyed by health status.
-    :param by_type: Cluster counts keyed by topology type.
-    :param services_total: Services across every cluster.
-    :param services_observed: …of which answered a probe.
-    :param services_unobserved: …of which did not. The honest headline number: a
-        service in inventory with no live exporter is neither healthy nor down.
+    Two conventions the frontend depends on, both deliberate:
+
+    * ``cpu_usage_percent`` and ``connections_free_percent`` are **-1 when not
+      measured**, never null and never 0. Zero CPU is a real reading, so a numeric
+      sentinel keeps "idle" and "unknown" apart in a column that must stay numeric.
+    * ``replication_lag_seconds`` and ``oplog_window_seconds`` *are* null when they do
+      not apply -- a router and a standalone have no replica-set oplog, and a
+      single-member set has no peer to lag behind. Null here means "not a thing for
+      this topology", which is different from -1's "we could not measure it".
+
+    :param service_name: The inventory service name.
+    :param host: The node the service runs on.
+    :param endpoint: ``host:port`` as the replica set addresses the member.
+    :param service_id: PMM's service UUID.
+    :param service_type: Always ``mongodb`` today.
+    :param version: The running server version.
+    :param vendor: ``MongoDB`` or ``Percona``.
+    :param edition: ``Community`` or ``Enterprise``.
+    :param replication_set: The replica set, or ``None`` for a router or standalone.
+    :param state: ``PRIMARY`` / ``SECONDARY`` / ``ARBITER``, or ``None``.
+    :param status: ``UP`` or ``DOWN``.
+    :param cpu_usage_percent: CPU percentage, or ``-1``.
+    :param connections_free_percent: Free-connection percentage, or ``-1``.
+    :param process_role: ``mongod``, ``mongos``, ``configsvr`` or ``shardsvr``.
+    :param replication_lag_seconds: Seconds behind the primary, or ``None``.
+    :param oplog_window_seconds: Seconds of oplog history, or ``None``.
     """
 
-    clusters: int
-    by_health: dict[str, int] = Field(default_factory=dict)
-    by_type: dict[str, int] = Field(default_factory=dict)
-    services_total: int
-    services_observed: int
-    services_unobserved: int
+    service_name: str
+    host: str | None = None
+    endpoint: str | None = None
+    service_id: str | None = None
+    service_type: str | None = None
+    version: str | None = None
+    vendor: str | None = None
+    edition: str | None = None
+    replication_set: str | None = None
+    state: str | None = None
+    status: str
+    cpu_usage_percent: float = -1
+    connections_free_percent: float = -1
+    process_role: str
+    replication_lag_seconds: float | None = None
+    oplog_window_seconds: float | None = None
 
 
-class GroupCount(BaseModel):
-    """Name one grouping bucket for the list view's group headers.
+class TopologyCluster(BaseModel):
+    """One cluster or replica set.
 
-    :param key: The machine value, e.g. ``critical``.
-    :param label: The display label, e.g. ``Critical``.
-    :param count: Clusters in the bucket.
+    :param name: The cluster label, or ``None`` when the services carry none.
+    :param services: Its services, ordered by name.
     """
 
-    key: str
-    label: str
-    count: int
+    name: str | None = None
+    services: list[TopologyService] = Field(default_factory=list)
 
 
-class ClusterListResponse(BaseModel):
-    """Return the cluster list, its summary and its grouping counts.
+class TopologyEnvironment(BaseModel):
+    """One monitoring environment.
 
-    ``clusters`` entries are the worker's assembled documents passed through
-    verbatim, so the wire shape is whatever the projection wrote. They are typed
-    loosely here on purpose: pinning every nested field would duplicate the
-    projection's contract in a second place and guarantee the two drift.
+    :param env_name: The environment label, or ``None`` when unset.
+    :param clusters: Its clusters, ordered by name.
+    """
 
-    :param generated_at: Snapshot provenance; see :class:`SnapshotEnvelope`.
-    :param observed_at: Newest observation in the snapshot.
-    :param stale: Whether the snapshot is past its grace period.
-    :param schema_version: The document schema version.
-    :param run_id: The discovery run this came from.
+    env_name: str | None = None
+    clusters: list[TopologyCluster] = Field(default_factory=list)
+
+
+class TopologySummary(BaseModel):
+    """Fleet-level counts, so the UI need not re-derive them.
+
+    :param environments: Environments in the snapshot.
+    :param clusters: Clusters across all of them.
+    :param services_total: Services in the snapshot.
+    :param services_up: ...of which reachable.
+    :param services_down: ...of which not.
+    :param by_process_role: Service counts per process role.
+    """
+
+    environments: int = 0
+    clusters: int = 0
+    services_total: int = 0
+    services_up: int = 0
+    services_down: int = 0
+    by_process_role: dict[str, int] = Field(default_factory=dict)
+
+
+class TopologyResponse(BaseModel):
+    """The whole topology document plus the provenance of the run behind it.
+
+    :param snapshot: Which run produced this, when, and whether it is stale.
+    :param origin_node: The PMM node the snapshot was taken from.
+    :param source_queries: The VictoriaMetrics queries the document was derived from.
     :param summary: Fleet-level counts.
-    :param groups: Grouping buckets for the current grouping.
-    :param clusters: The cluster documents, without their member lists.
-    :param next_cursor: Reserved for pagination; always ``None`` today.
+    :param environments: The estate, grouped environment then cluster.
     """
 
-    generated_at: datetime
-    observed_at: datetime | None = None
-    stale: bool = False
-    schema_version: int = 1
-    run_id: UUID
-    summary: HealthSummary
-    groups: list[GroupCount] = Field(default_factory=list)
-    clusters: list[dict[str, Any]] = Field(default_factory=list)
-    next_cursor: str | None = None
-
-
-class ClusterDetailResponse(BaseModel):
-    """Return one cluster's full document, members included.
-
-    :param generated_at: Snapshot provenance.
-    :param observed_at: Newest observation in the snapshot.
-    :param stale: Whether the snapshot is past its grace period.
-    :param schema_version: The document schema version.
-    :param run_id: The discovery run this came from.
-    :param cluster: The complete cluster document.
-    """
-
-    generated_at: datetime
-    observed_at: datetime | None = None
-    stale: bool = False
-    schema_version: int = 1
-    run_id: UUID
-    cluster: dict[str, Any]
+    snapshot: SnapshotEnvelope
+    origin_node: str | None = None
+    source_queries: list[str] = Field(default_factory=list)
+    summary: TopologySummary = Field(default_factory=TopologySummary)
+    environments: list[TopologyEnvironment] = Field(default_factory=list)
 
 
 class RunCounts(BaseModel):

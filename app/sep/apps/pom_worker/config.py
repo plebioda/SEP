@@ -103,7 +103,13 @@ class PomWorkerSettings(BaseYamlSettings):
     POLL_INTERVAL: PositiveInt = 3
     MAX_CONCURRENT_PROBES: PositiveInt = 8
     SOURCES: list[str] = ["inventory", "metrics", "probe"]
-    METRICS_GROUPS: list[str] = ["identity", "rs_status", "replication"]
+    METRICS_GROUPS: list[str] = [
+        "identity",
+        "rs_status",
+        "replication",
+        "health",
+        "sharding",
+    ]
     METRICS_LOOKBACK: str = "24h"
     METRICS_MAX_AGE: PositiveInt = 300
     METRICS_QUERY_BATCH: PositiveInt = 50

@@ -78,6 +78,7 @@ __all__ = [
     "AGE_TEMPLATE",
     "SOURCE_KEY",
     "VALUE_TEMPLATE",
+    "build_expression_query",
     "build_query",
     "collect_metric_facts",
     "parse_series",
@@ -116,6 +117,19 @@ _EXTERNAL_ID = re.compile(r"^[A-Za-z0-9-]+$")
 _SAMPLE_PAIR_LENGTH = 2
 
 
+def _matcher(external_ids: Sequence[str]) -> str:
+    """Return the ``service_id`` selector pinning a query to the live service set.
+
+    :param external_ids: The PMM service UUIDs to pin to.
+    :return: The matcher, without surrounding braces.
+    :raises ValueError: When an id is not of the expected shape.
+    """
+    for external_id in external_ids:
+        if not _EXTERNAL_ID.match(external_id):
+            raise ValueError(f"not a usable service id: {external_id!r}")
+    return f'service_id=~"{"|".join(sorted(external_ids))}"'
+
+
 def build_query(
     metric: str,
     external_ids: Sequence[str],
@@ -133,13 +147,23 @@ def build_query(
     """
     if not _METRIC_NAME.match(metric):
         raise ValueError(f"not a bare metric name: {metric!r}")
-    for external_id in external_ids:
-        if not _EXTERNAL_ID.match(external_id):
-            raise ValueError(f"not a usable service id: {external_id!r}")
-    selector = "|".join(sorted(external_ids))
     return template.format(
-        metric=metric, matcher=f'service_id=~"{selector}"', lookback=lookback
+        metric=metric, matcher=_matcher(external_ids), lookback=lookback
     )
+
+
+def build_expression_query(query: str, external_ids: Sequence[str]) -> str:
+    """Return a :attr:`Signal.query` expression with its matcher injected.
+
+    :param query: The catalog's PromQL template, carrying ``{matcher}`` placeholders.
+    :param external_ids: The PMM service UUIDs to pin to.
+    :return: The query string.
+    :raises ValueError: When an id is not of the expected shape, or the template names
+        no matcher -- an unpinned expression would silently span dead generations.
+    """
+    if "{matcher}" not in query:
+        raise ValueError(f"expression names no {{matcher}}: {query!r}")
+    return query.format(matcher=_matcher(external_ids))
 
 
 def _join_key(labels: dict[str, str]) -> tuple[tuple[str, str], ...]:
@@ -241,7 +265,16 @@ def _read_batch(
         _join_key(labels): value for labels, value in parse_series(value_payload or {})
     }
 
-    for labels, age in parse_series(age_payload):
+    # An expression signal has no age query, so the value response is what enumerates
+    # the services and every reading is dated to the run. Treating that as age 0 keeps
+    # one loop rather than two, and is honest: the sample is as fresh as the query.
+    driving = (
+        parse_series(age_payload)
+        if age_payload is not None
+        else [(labels, 0.0) for labels, _ in parse_series(value_payload or {})]
+    )
+
+    for labels, age in driving:
         service = by_external_id.get(labels.get("service_id", ""))
         if service is None:
             # A series belonging to a generation inventory no longer lists. The pinned
@@ -384,29 +417,40 @@ async def collect_metric_facts(
     external_ids = sorted(by_external_id)
 
     for metric, metric_signals in grouped.items():
-        # The value query is issued only when a signal on this metric actually reads the
-        # sample value, because `lag`'s value is the age rather than the metric's own.
+        # An expression signal carries its own PromQL and is value-only: `lag()` has no
+        # meaning over an aggregation, so there is no age query to pair with it and its
+        # facts are dated to the run instead of to a sample.
+        expression = next((s.query for s in metric_signals if s.query), None)
+        # Otherwise the value query is issued only when a signal on this metric actually
+        # reads the sample value, because `lag`'s value is the age, not the metric's own.
         needs_value = any(isinstance(s.take, Value) for s in metric_signals)
         for batch in _chunks(external_ids, batch_size):
             try:
-                age_payload = await pmm_api.get(
-                    QUERY_PATH,
-                    params={
-                        "query": build_query(metric, batch, lookback, AGE_TEMPLATE)
-                    },
-                )
-                value_payload = (
-                    await pmm_api.get(
+                if expression is not None:
+                    age_payload = None
+                    value_payload = await pmm_api.get(
+                        QUERY_PATH,
+                        params={"query": build_expression_query(expression, batch)},
+                    )
+                else:
+                    age_payload = await pmm_api.get(
                         QUERY_PATH,
                         params={
-                            "query": build_query(
-                                metric, batch, lookback, VALUE_TEMPLATE
-                            )
+                            "query": build_query(metric, batch, lookback, AGE_TEMPLATE)
                         },
                     )
-                    if needs_value
-                    else None
-                )
+                    value_payload = (
+                        await pmm_api.get(
+                            QUERY_PATH,
+                            params={
+                                "query": build_query(
+                                    metric, batch, lookback, VALUE_TEMPLATE
+                                )
+                            },
+                        )
+                        if needs_value
+                        else None
+                    )
             except Exception as err:  # noqa: BLE001 - one metric must not lose the rest
                 message = f"{metric}: {type(err).__name__}: {err}"
                 logger.warning("POM discovery: metrics query failed -- %s", message)

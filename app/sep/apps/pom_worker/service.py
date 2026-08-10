@@ -41,9 +41,9 @@ from app.core.utils.date_time import utc_now
 from app.inventory.config import inventory_settings
 from app.sep.apps.pom_worker.config import pom_worker_settings
 from app.sep.apps.pom_worker.crud import (
-    PomClusterManager,
     PomNodeManager,
     PomRunManager,
+    PomSnapshotManager,
 )
 from app.sep.apps.pom_worker.dispatch import HostProbeResult, probe_all
 from app.sep.apps.pom_worker.fact_sources import (
@@ -73,13 +73,13 @@ from app.sep.apps.pom_worker.metrics_source import (
 )
 from app.sep.apps.pom_worker.models import (
     NodeResolution,
-    PomCluster,
     PomNode,
     PomRun,
     PomRunStatus,
+    PomSnapshot,
     ProbeStatus,
 )
-from app.sep.apps.pom_worker.projection import build_cluster_documents, NodeRecord
+from app.sep.apps.pom_worker.topology import build_topology_document, NodeRecord
 from app.sep.config import sep_settings
 from app.sep.db import get_async_session_maker
 from app.sep.deps import get_pmm_api
@@ -200,29 +200,18 @@ async def run_discovery(execution_id: UUID | None = None) -> UUID:
     resolved = sum(1 for entry in mapped if entry.is_resolved)
     orphaned = len(mapped) - resolved
 
-    # The node rows, the cluster snapshot and the terminal run status are written in
+    # The node rows, the topology snapshot and the terminal run status are written in
     # ONE transaction. That is what makes a reader see a complete snapshot or the
-    # previous one, never a half-written topology: the API only ever reads clusters
+    # previous one, never a half-written topology: the API only ever reads a snapshot
     # belonging to a run whose status is already terminal.
-    clusters = build_cluster_documents(_node_records(rows), utc_now())
+    origin_node = _origin_node()
+    document = build_topology_document(
+        _node_records(rows), utc_now(), origin_node=origin_node
+    )
     async with session_maker() as session:
         await PomNodeManager.save_batch(session, *rows)
-        await PomClusterManager.save_batch(
-            session,
-            *(
-                PomCluster(
-                    run_id=execution_id,
-                    cluster_id=document["id"],
-                    name=document["name"],
-                    cluster_type=document["type"],
-                    environment=document["environment"],
-                    health_status=document["health"]["status"],
-                    members_total=document["members_total"],
-                    members_observed=document["members_observed"],
-                    document=document,
-                )
-                for document in clusters
-            ),
+        await PomSnapshotManager.save(
+            session, PomSnapshot(run_id=execution_id, document=document)
         )
         finished = await PomRunManager.get(session, id=execution_id)
         finished.status = _run_status(sources)
@@ -231,7 +220,7 @@ async def run_discovery(execution_id: UUID | None = None) -> UUID:
         finished.services_resolved = resolved
         finished.services_orphaned = orphaned
         finished.probes_ok = probes_ok
-        finished.origin_node = _origin_node()
+        finished.origin_node = origin_node
         finished.sources = {
             key: {"status": str(result.status), **result.detail}
             for key, result in sources.items()
@@ -291,6 +280,7 @@ async def _collect(
                 run_id=execution_id,
                 service_name=entry.service.name,
                 service_id=entry.service.service_id,
+                external_id=entry.service.external_id,
                 cluster=entry.service.cluster,
                 replication_set=entry.service.replication_set,
                 environment=entry.service.environment,
@@ -433,26 +423,21 @@ def _apply_facts(rows: list[PomNode], sources: dict[str, SourceResult]) -> None:
 
 
 def _node_records(rows: list[PomNode]) -> list[NodeRecord]:
-    """Adapt persisted node rows into the projection's plain input type.
+    """Adapt persisted node rows into the document builder's plain input type.
 
-    Kept as an explicit adapter so ``projection`` never imports a SQLModel and stays
+    Kept as an explicit adapter so ``topology`` never imports a SQLModel and stays
     testable without a database.
 
     :param rows: The run's node rows.
-    :return: The projection input.
+    :return: The document builder's input.
     """
     return [
         NodeRecord(
             service_name=row.service_name,
-            service_id=row.service_id,
+            external_id=row.external_id,
             cluster=row.cluster,
             replication_set=row.replication_set,
             environment=row.environment,
-            port=row.port,
-            executor_host=row.executor_host,
-            resolution=str(row.resolution),
-            probe_status=str(row.probe_status),
-            probe=row.probe,
             facts=row.facts or {},
         )
         for row in rows
