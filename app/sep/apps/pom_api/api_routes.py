@@ -45,32 +45,29 @@ from app.core.exceptions import (
 )
 from app.core.utils.date_time import utc_now
 from app.sep.apps.pom_api.crud import (
-    cluster_for_run,
-    clusters_for_run,
     get_run,
     latest_snapshot_run,
     recent_runs,
     running_run,
+    snapshot_for_run,
 )
 from app.sep.apps.pom_api.schemas import (
-    ClusterDetailResponse,
-    ClusterListResponse,
     DiscoveryRunAccepted,
     DiscoveryRunResponse,
-    GroupCount,
-    HealthSummary,
     RunCounts,
     RunError,
+    SnapshotEnvelope,
+    TopologyEnvironment,
+    TopologyResponse,
+    TopologySummary,
 )
 from app.sep.apps.pom_worker.config import pom_worker_settings
 from app.sep.apps.pom_worker.crud import PomRunManager
 from app.sep.apps.pom_worker.models import (
     NodeResolution,
-    PomCluster,
     PomNode,
     PomRun,
 )
-from app.sep.apps.pom_worker.projection import build_summary
 from app.sep.apps.pom_worker.reap import sweep_stale_runs
 from app.sep.deps import SessionDep
 
@@ -108,122 +105,55 @@ router = APIRouter(dependencies=[Depends(_swagger_bearer)])
 #: the UI shows stale data with a marker rather than an error page.
 SNAPSHOT_GRACE = timedelta(minutes=30)
 
-#: Display labels for the health buckets the list view groups by, worst first.
-_HEALTH_LABELS = (
-    ("critical", "Critical"),
-    ("warning", "Warning"),
-    ("unknown", "Unknown"),
-    ("ok", "Healthy"),
-)
 
-
-def _envelope(run: PomRun, documents: list[dict[str, Any]]) -> dict[str, Any]:
-    """Build the provenance fields every snapshot-backed response repeats.
+def _envelope(run: PomRun, document: dict[str, Any]) -> dict[str, Any]:
+    """Build the provenance fields the topology response carries.
 
     :param run: The run the snapshot came from.
-    :param documents: The cluster documents in it.
+    :param document: The topology document.
     :return: The envelope fields.
     """
-    observed = [
-        doc["health"]["observed_at"]
-        for doc in documents
-        if doc["health"]["observed_at"]
-    ]
     generated_at = run.finished_at or run.started_at
     return {
         "generated_at": generated_at,
-        "observed_at": max(observed) if observed else None,
+        # The document is assembled in one pass from one set of queries, so its
+        # observation time is the run's -- there is no per-cluster spread to fold.
+        "observed_at": generated_at,
         "stale": utc_now() - generated_at > SNAPSHOT_GRACE,
-        "schema_version": next((doc.get("schema_version", 1) for doc in documents), 1),
+        "schema_version": document.get("schema_version", 1),
         "run_id": run.id,
     }
 
 
-async def _require_snapshot(session: SessionDep) -> tuple[PomRun, list[PomCluster]]:
-    """Return the newest complete snapshot, or fail with 503.
+@router.get("/topology", response_model=TopologyResponse)
+async def get_topology(session: SessionDep) -> TopologyResponse:
+    """Return the newest complete topology snapshot.
+
+    Served whole rather than paged: the document is one nested tree and the UI renders
+    all of it. A stale snapshot is returned with ``snapshot.stale`` set rather than
+    replaced by an error, so the page shows the last known estate with a marker instead
+    of going blank whenever collection lapses.
 
     :param session: The database session.
-    :return: The run and its cluster rows.
+    :return: The topology response.
     :raises HTTPServiceUnavailableException: When no discovery has ever finished.
     """
     run = await latest_snapshot_run(session)
-    if run is None:
+    snapshot = await snapshot_for_run(session, run.id) if run else None
+    if run is None or snapshot is None:
         raise HTTPServiceUnavailableException(
             "No discovery run has completed yet; trigger one with POST /discovery/runs."
         )
-    return run, await clusters_for_run(session, run.id)
-
-
-@router.get("/clusters", response_model=ClusterListResponse)
-async def list_clusters(
-    session: SessionDep,
-    health: str | None = Query(None, description="Filter by health status."),
-    cluster_type: str | None = Query(
-        None, alias="type", description="Filter by topology type."
-    ),
-    environment: str | None = Query(None, description="Filter by environment label."),
-) -> ClusterListResponse:
-    """Return every cluster in the newest snapshot, with summary and group counts.
-
-    Member lists are omitted -- the list view does not render them, and including
-    them would multiply the response size by the fleet's node count for no benefit.
-    Fetch one cluster's detail for its members.
-
-    Filters are applied **after** the summary is computed, so the summary always
-    describes the whole fleet while ``clusters`` describes the current filter. That
-    is what lets the UI show "3 of 18" without a second request.
-
-    :param session: The database session.
-    :param health: Optional health-status filter.
-    :param cluster_type: Optional topology-type filter.
-    :param environment: Optional environment filter.
-    :return: The cluster list response.
-    :raises HTTPServiceUnavailableException: When no snapshot exists yet.
-    """
-    run, rows = await _require_snapshot(session)
-    documents = [row.document for row in rows]
-
-    summary = build_summary(documents)
-    groups = [
-        GroupCount(key=key, label=label, count=summary["by_health"].get(key, 0))
-        for key, label in _HEALTH_LABELS
-        if summary["by_health"].get(key)
-    ]
-
-    selected = [
-        doc
-        for doc in documents
-        if (health is None or doc["health"]["status"] == health)
-        and (cluster_type is None or doc["type"] == cluster_type)
-        and (environment is None or doc["environment"] == environment)
-    ]
-    # The list view never renders members; detail does.
-    listed = [{k: v for k, v in doc.items() if k != "members"} for doc in selected]
-
-    return ClusterListResponse(
-        **_envelope(run, documents),
-        summary=HealthSummary(**summary),
-        groups=groups,
-        clusters=listed,
-    )
-
-
-@router.get("/clusters/{cluster_id}", response_model=ClusterDetailResponse)
-async def get_cluster(cluster_id: str, session: SessionDep) -> ClusterDetailResponse:
-    """Return one cluster's full document, members included.
-
-    :param cluster_id: The opaque cluster id from the list response.
-    :param session: The database session.
-    :return: The cluster detail response.
-    :raises HTTPNotFoundException: When the snapshot holds no such cluster.
-    :raises HTTPServiceUnavailableException: When no snapshot exists yet.
-    """
-    run, rows = await _require_snapshot(session)
-    row = await cluster_for_run(session, run.id, cluster_id)
-    if row is None:
-        raise HTTPNotFoundException(f"No cluster with id {cluster_id}")
-    return ClusterDetailResponse(
-        **_envelope(run, [r.document for r in rows]), cluster=row.document
+    document = snapshot.document
+    return TopologyResponse(
+        snapshot=SnapshotEnvelope(**_envelope(run, document)),
+        origin_node=document.get("origin_node"),
+        source_queries=document.get("source_queries", []),
+        summary=TopologySummary(**(document.get("summary") or {})),
+        environments=[
+            TopologyEnvironment(**environment)
+            for environment in document.get("environments", [])
+        ],
     )
 
 

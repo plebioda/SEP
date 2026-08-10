@@ -104,17 +104,28 @@ class TestMergePrecedence:
         )
         assert "vendor" not in merged.get("7", {})
 
-    def test_endpoint_is_inventory_only(self):
-        """No VictoriaMetrics label carries an address and port."""
+    def test_endpoint_prefers_the_replica_sets_own_address(self):
+        """Prefer the replica set's own address for the member.
+
+        `member_idx` is how the set addresses the member; inventory records where PMM
+        reached the agent, which is not the same thing in a sidecar deployment.
+        """
         merged = merge_facts(
             [
-                _result("metrics", Fact("7", "endpoint", "wrong:1", "metrics")),
+                _result("metrics", Fact("7", "endpoint", "mongo1:27017", "metrics")),
                 _result(
-                    "inventory", Fact("7", "endpoint", "mongo1:27017", "inventory")
+                    "inventory", Fact("7", "endpoint", "127.0.0.1:27017", "inventory")
                 ),
             ]
         )
         assert merged["7"]["endpoint"].value == "mongo1:27017"
+
+    def test_endpoint_falls_back_to_inventory(self):
+        """A mongos carries no member_idx, so inventory is all there is."""
+        merged = merge_facts(
+            [_result("inventory", Fact("7", "endpoint", "mongos:27017", "inventory"))]
+        )
+        assert merged["7"]["endpoint"].source == "inventory"
 
     def test_precedence_is_declared_not_call_order(self):
         """Reordering the sources changes nothing; only the table decides."""

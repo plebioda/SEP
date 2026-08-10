@@ -30,7 +30,7 @@ from typing import Any
 
 from app.sep.apps.pom_worker.facts import Fact, ServiceKey, SourceResult, SourceStatus
 from app.sep.apps.pom_worker.inventory import InventoryService
-from app.sep.apps.pom_worker.projection import member_state_name
+from app.sep.apps.pom_worker.topology import member_state_name
 
 __all__ = [
     "INVENTORY_SOURCE_KEY",

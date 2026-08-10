@@ -179,12 +179,21 @@ DEFAULT_PRECEDENCE: Mapping[str, tuple[str, ...]] = {
     "installed_version": ("probe",),
     "vendor": ("metrics",),
     "edition": ("metrics",),
-    "endpoint": ("inventory",),
+    # ``member_idx`` is how the replica set itself addresses the member, which beats
+    # inventory's record of where PMM reached the agent. Inventory stays the fallback,
+    # and is the only source for a mongos, which has no member_idx.
+    "endpoint": ("metrics", "inventory"),
     # Replication health. Metrics-only: no other source can supply any of them,
     # and an unlisted source is forbidden from trying.
     "replication_lag_seconds": ("metrics",),
     "oplog_head_timestamp": ("metrics",),
     "oplog_tail_timestamp": ("metrics",),
+    # Reachability, load and role, all of them exporter-only concepts.
+    "exporter_up": ("metrics",),
+    "cpu_usage_percent": ("metrics",),
+    "connections_free_percent": ("metrics",),
+    "cluster_role": ("metrics",),
+    "is_mongos": ("metrics",),
     "state": ("metrics", "probe"),
 }
 

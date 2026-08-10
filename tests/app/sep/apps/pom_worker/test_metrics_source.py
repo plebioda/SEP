@@ -54,7 +54,9 @@ def _expected_queries(signals=SIGNALS) -> int:
     query for each metric that carries at least one Value signal.
     """
     return sum(
-        1 + any(isinstance(sig.take, Value) for sig in group)
+        1
+        if any(sig.query for sig in group)
+        else 1 + any(isinstance(sig.take, Value) for sig in group)
         for group in by_metric(signals).values()
     )
 
@@ -323,7 +325,9 @@ class TestCollectMetricFacts:
             )
         )
         result = await _collect(pmm)
-        assert all(fact.field == "state" for fact in result.facts)
+        # Nothing from mongodb_version_info survives; only the other metrics' facts do.
+        assert not any(fact.field == "version" for fact in result.facts)
+        assert not any(fact.field == "vendor" for fact in result.facts)
 
     async def test_services_without_a_pmm_id_are_counted_not_guessed(self, pmm):
         """No external id means nothing to pin a query to -- and no name-based guess."""

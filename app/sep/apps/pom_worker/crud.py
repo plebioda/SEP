@@ -16,7 +16,7 @@
 """Define CRUD managers for the POM worker tables."""
 
 from app.core.db.crud import BaseSQLModelManager
-from app.sep.apps.pom_worker.models import PomCluster, PomNode, PomRun
+from app.sep.apps.pom_worker.models import PomNode, PomRun, PomSnapshot
 
 
 class PomRunManager(BaseSQLModelManager):
@@ -37,10 +37,10 @@ class PomNodeManager(BaseSQLModelManager):
     Model = PomNode
 
 
-class PomClusterManager(BaseSQLModelManager):
-    """Manage :class:`PomCluster` CRUD operations.
+class PomSnapshotManager(BaseSQLModelManager):
+    """Manage :class:`PomSnapshot` CRUD operations.
 
     :cvar Model: The SQLModel class this manager is responsible for.
     """
 
-    Model = PomCluster
+    Model = PomSnapshot

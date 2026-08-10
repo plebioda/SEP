@@ -79,10 +79,36 @@ REPLICATION_LAG = "mongodb_mongod_replset_member_replication_lag"
 OPLOG_HEAD = "mongodb_mongod_replset_oplog_head_timestamp"
 OPLOG_TAIL = "mongodb_mongod_replset_oplog_tail_timestamp"
 
+#: The exporter's own reachability flag: 1 when it connected to mongod. A service that
+#: is down produces **no series at all** rather than a 0, so absence is what the
+#: document reads as DOWN.
+MONGODB_UP = "mongodb_up"
+#: Emitted only by a mongos, so its presence *is* the router test. More reliable than
+#: the port convention, which only ever guessed.
+MONGOS_SHARDS_TOTAL = "mongodb_mongos_sharding_shards_total"
+
+#: Derived percentages. Neither exists as a series, so both are :attr:`Signal.query`
+#: expressions. Both aggregate ``by (service_id)`` rather than by ``service_name``,
+#: which is what keeps them joinable: a name resolves to several generations of
+#: service ids once anything has been re-registered.
+CPU_USAGE = "pom:cpu_usage_percent"
+CPU_USAGE_QUERY = (
+    "100 * (1 - sum by (service_id) (irate(mongodb_sys_cpu_idle_ms{{{matcher}}}[30s]))"
+    " / (1000 * max by (service_id) (mongodb_sys_cpu_num_logical_cores{{{matcher}}})))"
+)
+CONNECTIONS_FREE = "pom:connections_free_percent"
+CONNECTIONS_FREE_QUERY = (
+    '100 * max by (service_id) (mongodb_connections{{{matcher},state="available"}})'
+    ' / (max by (service_id) (mongodb_connections{{{matcher},state="current"}})'
+    ' + max by (service_id) (mongodb_connections{{{matcher},state="available"}}))'
+)
+
 #: Signal groups, each independently switchable via ``SEP.POM_WORKER.METRICS_GROUPS``.
 GROUP_IDENTITY = "identity"
 GROUP_RS_STATUS = "rs_status"
 GROUP_REPLICATION = "replication"
+GROUP_HEALTH = "health"
+GROUP_SHARDING = "sharding"
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +172,15 @@ class Signal:
         window, say -- needs an explicit escape hatch added here first.
     :param take: How to read the value: :class:`Label` or :class:`Value`.
     :param group: The switchable group this belongs to.
+    :param query: A PromQL template used **instead of** wrapping ``metric``, for a
+        derived value no single series carries -- a CPU percentage, a free-connection
+        ratio. It must contain ``{matcher}`` wherever a selector belongs, and it must
+        aggregate ``by (service_id)`` so the result still joins back to a service.
+        ``metric`` then names the query rather than a series, and is only the grouping
+        key. Two consequences, both deliberate: an expression is **value-only**, since
+        ``lag()`` has no meaning over an arbitrary expression, so its facts are dated to
+        the run rather than to a sample; and it must never be built from user input,
+        because it is interpolated into PromQL.
     :param reduce: Folds several series for one service into one fact, e.g. :func:`max`.
         ``None`` keeps the one-series-per-service assumption every other signal relies
         on. Required whenever a metric emits more than one series per service:
@@ -159,6 +194,7 @@ class Signal:
     metric: str
     take: Label | Value
     group: str
+    query: str | None = None
     reduce: Callable[[list[Any]], Any] | None = None
 
 
@@ -177,6 +213,32 @@ SIGNALS: tuple[Signal, ...] = (
     Signal("edition", VERSION_INFO, Label("edition"), GROUP_IDENTITY),
     # -- mongodb_members_self: this node's own replica-set state ----------------
     Signal("state", MEMBERS_SELF, Label("member_state"), GROUP_RS_STATUS),
+    # ``member_idx`` is the host:port the replica set itself knows the member by, which
+    # is a truer endpoint than inventory's address -- inventory records where PMM
+    # reached the agent, not where the member advertises itself. A mongos carries no
+    # member_idx, so inventory remains the fallback.
+    Signal("endpoint", MEMBERS_SELF, Label("member_idx"), GROUP_RS_STATUS),
+    # configsvr / shardsvr, straight from the exporter. Replaces the port-convention
+    # guess the projection used to fall back on.
+    Signal("cluster_role", MEMBERS_SELF, Label("cl_role"), GROUP_RS_STATUS),
+    # -- reachability and load --------------------------------------------------
+    Signal("exporter_up", MONGODB_UP, Value(float), GROUP_HEALTH),
+    Signal(
+        "cpu_usage_percent",
+        CPU_USAGE,
+        Value(float),
+        GROUP_HEALTH,
+        query=CPU_USAGE_QUERY,
+    ),
+    Signal(
+        "connections_free_percent",
+        CONNECTIONS_FREE,
+        Value(float),
+        GROUP_HEALTH,
+        query=CONNECTIONS_FREE_QUERY,
+    ),
+    # -- sharding: presence alone identifies a router ---------------------------
+    Signal("is_mongos", MONGOS_SHARDS_TOTAL, Value(bool), GROUP_SHARDING),
     # -- replication health: the first Value signals in the catalog -------------
     # ``max`` over every series a service reports: each member reports lag against
     # every secondary, so the worst of them is "the worst lag this node saw", and the
