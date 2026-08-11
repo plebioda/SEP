@@ -28,7 +28,7 @@ already filters server-side to ready clients with a healthy ``raw_exec`` driver.
 ``strict_executor_matching`` off, an unmatched node resolves to
 ``next(iter(available_hosts))`` -- an arbitrary unrelated host -- and the probe runs
 there and reports facts about a mongod that is not on that box. Here an unmatched
-service is :attr:`~app.sep.apps.pom_worker.models.NodeResolution.ORPHANED` and is not
+service is :attr:`~app.sep.apps.pom_discovery.models.NodeResolution.ORPHANED` and is not
 probed at all.
 
 That case is the norm, not an edge: an inventory row routinely outlives the executor
@@ -39,8 +39,8 @@ import logging
 from dataclasses import dataclass
 
 from app.core.requests import RemoteAPI
-from app.sep.apps.pom_worker.inventory import InventoryService
-from app.sep.apps.pom_worker.models import NodeResolution
+from app.sep.apps.pom_discovery.inventory import InventoryService
+from app.sep.apps.pom_discovery.models import NodeResolution
 
 logger = logging.getLogger(__name__)
 
@@ -79,7 +79,7 @@ async def get_executor_hosts(tasks_api: RemoteAPI) -> dict[str, str]:
     :return: The available executor hosts keyed by name.
     """
     hosts = await tasks_api.get("/hosts/")
-    logger.info("POM worker: %d executor host(s) available", len(hosts))
+    logger.info("POM discovery: %d executor host(s) available", len(hosts))
     return hosts
 
 
@@ -102,7 +102,7 @@ def map_service(
 
     # Deliberately not falling back to an arbitrary host -- see the module docstring.
     logger.info(
-        "POM worker: service %r is orphaned (node name=%r address=%r matches no "
+        "POM discovery: service %r is orphaned (node name=%r address=%r matches no "
         "executor host); it will not be probed",
         service.name,
         service.node_name,
@@ -123,7 +123,7 @@ def map_services(
     mapped = [map_service(service, executor_hosts) for service in services]
     resolved = sum(1 for entry in mapped if entry.is_resolved)
     logger.info(
-        "POM worker: mapped %d service(s) -> %d resolved, %d orphaned",
+        "POM discovery: mapped %d service(s) -> %d resolved, %d orphaned",
         len(mapped),
         resolved,
         len(mapped) - resolved,

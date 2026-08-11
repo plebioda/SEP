@@ -38,9 +38,9 @@ from pathlib import Path
 from typing import Any
 
 from app.core.requests import RemoteAPI
-from app.sep.apps.pom_worker import payload as payload_pkg
-from app.sep.apps.pom_worker.config import pom_worker_settings
-from app.sep.apps.pom_worker.mapping import MappedService
+from app.sep.apps.pom_discovery import payload as payload_pkg
+from app.sep.apps.pom_discovery.config import pom_discovery_settings
+from app.sep.apps.pom_discovery.mapping import MappedService
 from app.tasks.models import TaskHistoryStatusEnum, TaskLogType
 
 logger = logging.getLogger(__name__)
@@ -107,9 +107,9 @@ def build_config(entries: list[MappedService]) -> str:
                 }
                 for entry in entries
             ],
-            "probe_database": pom_worker_settings.PROBE_DATABASE,
-            "credentials_path": pom_worker_settings.CREDENTIALS_PATH,
-            "connect_timeout_ms": pom_worker_settings.CONNECT_TIMEOUT * 1000,
+            "probe_database": pom_discovery_settings.PROBE_DATABASE,
+            "credentials_path": pom_discovery_settings.CREDENTIALS_PATH,
+            "connect_timeout_ms": pom_discovery_settings.CONNECT_TIMEOUT * 1000,
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -150,9 +150,9 @@ async def _wait_for_terminal(tasks_api: RemoteAPI, task_history_id: int) -> str:
     """
     waited = 0
     status = TaskHistoryStatusEnum.PENDING.value
-    while waited < pom_worker_settings.TASK_TIMEOUT:
-        await asyncio.sleep(pom_worker_settings.POLL_INTERVAL)
-        waited += pom_worker_settings.POLL_INTERVAL
+    while waited < pom_discovery_settings.TASK_TIMEOUT:
+        await asyncio.sleep(pom_discovery_settings.POLL_INTERVAL)
+        waited += pom_discovery_settings.POLL_INTERVAL
         history = await tasks_api.get(f"/history/{task_history_id}")
         status = history["status"]
         if status not in (
@@ -162,7 +162,7 @@ async def _wait_for_terminal(tasks_api: RemoteAPI, task_history_id: int) -> str:
             return status
     raise TimeoutError(
         f"probe task history {task_history_id} still {status} after "
-        f"{pom_worker_settings.TASK_TIMEOUT}s"
+        f"{pom_discovery_settings.TASK_TIMEOUT}s"
     )
 
 
@@ -220,7 +220,7 @@ async def probe_host(
             return result
         result.task_history_id = int(created["id"])
         logger.info(
-            "POM worker: dispatched probe to %s for %d service(s), history %s",
+            "POM discovery: dispatched probe to %s for %d service(s), history %s",
             executor_host,
             len(entries),
             result.task_history_id,
@@ -236,7 +236,7 @@ async def probe_host(
         if status != TaskHistoryStatusEnum.SUCCESS.value and not result.records:
             result.error = f"probe run {status}: {stderr.strip()[:500] or 'no output'}"
     except Exception as err:
-        logger.exception("POM worker: probe of %s failed", executor_host)
+        logger.exception("POM discovery: probe of %s failed", executor_host)
         result.error = f"{type(err).__name__}: {err}"
     return result
 
@@ -255,10 +255,10 @@ async def probe_all(
     """
     grouped = group_by_executor(mapped)
     if not grouped:
-        logger.warning("POM worker: no service resolved to an executor host")
+        logger.warning("POM discovery: no service resolved to an executor host")
         return {}
 
-    semaphore = asyncio.Semaphore(pom_worker_settings.MAX_CONCURRENT_PROBES)
+    semaphore = asyncio.Semaphore(pom_discovery_settings.MAX_CONCURRENT_PROBES)
 
     async def guarded(host: str, entries: list[MappedService]) -> HostProbeResult:
         async with semaphore:
