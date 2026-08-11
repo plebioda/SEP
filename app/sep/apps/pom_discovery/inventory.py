@@ -118,7 +118,7 @@ async def list_mongodb_services(inventory_api: RemoteAPI) -> list[InventoryServi
         if (service := _service_from_entry(entry)) is not None
     ]
     logger.info(
-        "POM worker: inventory lists %d MongoDB service(s), %d usable",
+        "POM discovery: inventory lists %d MongoDB service(s), %d usable",
         len(listed),
         len(services),
     )

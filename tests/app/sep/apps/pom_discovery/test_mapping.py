@@ -24,9 +24,9 @@ orphaned behaviour so that fallback can never be reintroduced by accident.
 
 import pytest
 
-from app.sep.apps.pom_worker.inventory import InventoryService
-from app.sep.apps.pom_worker.mapping import map_service, map_services
-from app.sep.apps.pom_worker.models import NodeResolution
+from app.sep.apps.pom_discovery.inventory import InventoryService
+from app.sep.apps.pom_discovery.mapping import map_service, map_services
+from app.sep.apps.pom_discovery.models import NodeResolution
 
 #: Services in the three-service fixture that resolve to a live executor.
 EXPECTED_RESOLVED = 2
