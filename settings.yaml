@@ -284,10 +284,38 @@ development:
   PMM:
     ENDPOINT: https://127.0.0.1:8443
     VERIFY_SSL: false
+    ANNOTATIONS_ENABLED: true
+  INVENTORY:
+    DATABASE: &pmm_embedded_db
+      # PMM's embedded PostgreSQL, exposed by PMM_ENABLE_SEP (percona/pmm#5700).
+      # All three services and the Celery beat store share the one `sep` database
+      # the exposure provisions; the Alembic tracks use distinct version tables.
+      # PASSWORD comes from .env (SEP__/INVENTORY__/TASKS__DATABASE__PASSWORD).
+      ENGINE: postgresql
+      HOST: 127.0.0.1
+      PORT: 5432
+      NAME: sep
+      USER: sep
   TASKS:
+    DATABASE: *pmm_embedded_db
     ANONYMIZER:
       DEFAULT_ENTITIES: []
+    NOMAD:
+      # PMM's embedded Nomad, reached through nginx. That location keeps
+      # auth_request on, so the credentials ride in the URL — python-nomad has no
+      # setting for a Basic/Bearer header of its own.
+      ENDPOINT: https://admin:admin@127.0.0.1:8443/nomad
+      SECURE: true
+      VERIFY_SSL: false
   SEP:
+    DATABASE: *pmm_embedded_db
+    # Sign in an unauthenticated caller from the ambient PMM session — the other
+    # half of PMM-15293's /api/oauth/session/exchange.
+    AMBIENT_SESSION_SSO_ENABLED: true
+    # The default 127.0.0.1 is unreachable from the PMM container, which proxies
+    # the five SEP prefixes to host.docker.internal. Same exposure level as the
+    # PMM devcontainer's own published 8443 — a dev box, not a shared host.
+    UVICORN_HOST: "0.0.0.0"
     UVICORN_RELOAD: true
     # UVICORN_EXTRA_RELOAD_DIRS:
     #   - /path/to/extra/dir
@@ -321,8 +349,15 @@ development:
         DEFAULT_EXECUTOR_HOST: null  # Optional: Nomad node name from /api/tasks/hosts/ for RDS/DBaaS
   AUTH:
     PROVIDER:
-      casdoor:
-        organization_name: built-in
+      # Auth has exactly one active provider. `null` drops the entry the default
+      # block merged in (see AuthSettings._resolve_provider step 2) so Grafana is
+      # the only one left — the PMM session is the identity here, not Casdoor.
+      casdoor: null
+      grafana:
+        endpoint: https://127.0.0.1:8443/graph
+        session_cookie_name: pmm_session
+        verify_ssl: false
+        # service_account_token comes from .env
   CELERY:
     BROKER_URL: "filesystem://"
     BROKER_TRANSPORT_OPTIONS:
@@ -333,7 +368,9 @@ development:
     RESULT_BACKEND: file://data/celery/results
     RESULT_EXPIRES: 3600
     RESULT_PERSISTENT: True
-    BEAT_DBURI: "sqlite:///schedule.db"
+    # Beat schedule lives in the same `sep` database; overridden with the password
+    # from .env as CELERY__BEAT_DBURI.
+    BEAT_DBURI: "postgresql://sep@127.0.0.1:5432/sep"
   ALERTING:
     SOURCE_SUFFIX: ":dev"
 
