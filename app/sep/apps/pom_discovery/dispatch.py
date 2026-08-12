@@ -173,6 +173,63 @@ async def _wait_for_terminal(tasks_api: RemoteAPI, task_history_id: int) -> str:
     )
 
 
+async def _release(tasks_api: RemoteAPI, task_history_id: int) -> str | None:
+    """Drive an abandoned dispatch to a terminal status.
+
+    Giving up on a probe ends *this sweep's* wait; it does nothing to the queue item,
+    which stays ``RUNNING`` with nothing left to advance it. That matters more than it
+    sounds: the tasks API refuses to dispatch a queue item identical to one already in
+    flight, and every sweep dispatches the same ``run-python`` to the same host with
+    the same config -- so one abandoned run makes that host answer ``409`` forever, and
+    its facts quietly stop refreshing while the sweep still reports itself partial.
+    Measured on the sandbox: seven such rows blocked their hosts for over an hour, and
+    the sweeps in between looked like unreachable nodes rather than a queue that needed
+    clearing.
+
+    Best-effort by design. The stop can legitimately fail -- most sharply when the
+    allocation is already gone, which is the case most likely to have caused the
+    abandonment in the first place -- and a sweep must not fail because its cleanup
+    did. The reason comes back so the caller can say the dispatch was left in flight,
+    because a queue item that could not be released is the one thing here that needs a
+    human.
+
+    :param tasks_api: The tasks API client.
+    :param task_history_id: The run to release.
+    :return: The failure detail, or ``None`` when there was nothing to release or the
+        run was released.
+    """
+    try:
+        history = await tasks_api.get(f"/history/{task_history_id}")
+        # Not every failure after a dispatch leaves the queue item in flight -- losing
+        # the log stream of a run that already finished is a failure of collection,
+        # not of the run. Stopping a terminal item answers 400, and reporting that as
+        # "could not be released" would raise an alarm about a queue that is clean.
+        if history["status"] not in (
+            TaskHistoryStatusEnum.PENDING.value,
+            TaskHistoryStatusEnum.RUNNING.value,
+        ):
+            return None
+    except Exception:
+        # Unreadable status is not a reason to skip the stop: the whole point is to
+        # not leave a queue item behind, and an unnecessary stop is harmless.
+        logger.exception(
+            "POM discovery: could not read probe task history %s before releasing it",
+            task_history_id,
+        )
+
+    try:
+        await tasks_api.post(f"/history/{task_history_id}/stop/")
+    except Exception as err:
+        logger.exception(
+            "POM discovery: could not release probe task history %s", task_history_id
+        )
+        return f"{type(err).__name__}: {err}"
+    logger.info(
+        "POM discovery: released abandoned probe task history %s", task_history_id
+    )
+    return None
+
+
 async def _read_stdout(tasks_api: RemoteAPI, task_history_id: int) -> tuple[str, str]:
     """Stream a finished run's logs and return its ``(stdout, stderr)``.
 
@@ -248,6 +305,17 @@ async def probe_host(
     except Exception as err:
         logger.exception("POM discovery: probe of %s failed", executor_host)
         result.error = f"{type(err).__name__}: {err}"
+        # Only a dispatch that reached the queue can be left in it. Anything that
+        # failed before an id came back never became a queue item, and there is
+        # nothing to release.
+        if result.task_history_id is not None:
+            release_error = await _release(tasks_api, result.task_history_id)
+            if release_error:
+                result.error = (
+                    f"{result.error} -- and task history "
+                    f"{result.task_history_id} could not be released, so it will "
+                    f"block this host's next probe: {release_error}"
+                )
     finally:
         # In a finally so a host that failed or returned early is still timed: how
         # long a broken host took before giving up is as diagnostic as how long a
