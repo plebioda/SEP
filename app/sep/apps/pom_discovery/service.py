@@ -32,6 +32,8 @@ caller to justify one.
 """
 
 import logging
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from typing import Any
 from uuid import UUID
 
@@ -169,14 +171,38 @@ def _record_for(entry: Any, host_results: dict[str, HostProbeResult]) -> dict | 
     return result.records.get(entry.service.name)
 
 
-async def _sweep(observed_at: str) -> tuple[int, int, int, int, list[dict[str, Any]]]:
+@dataclass
+class SweepOutcome:
+    """Carry everything one sweep produced.
+
+    A dataclass rather than the tuple this used to return: the counters, the facts
+    and now the per-service records are three different things, and positional
+    unpacking of six values at the call site said which was which only by convention.
+
+    :param total: Services inventory reported.
+    :param resolved: ...of which mapped to a live executor host.
+    :param orphaned: ...of which did not.
+    :param answered: Services whose host returned a usable record.
+    :param facts: The collected facts.
+    :param nodes: One record per mapped service; see :class:`ProbeRun`.
+    """
+
+    total: int = 0
+    resolved: int = 0
+    orphaned: int = 0
+    answered: int = 0
+    facts: list[dict[str, Any]] = dc_field(default_factory=list)
+    nodes: list[dict[str, Any]] = dc_field(default_factory=list)
+
+
+async def _sweep(observed_at: str) -> SweepOutcome:
     """Map, probe and collect, without touching the run row.
 
     Split out so :func:`run_probe` reads as the lifecycle it is -- create, work,
     record -- rather than interleaving the two.
 
     :param observed_at: When the sweep began, ISO 8601, stamped on every fact.
-    :return: Total, resolved, orphaned and answered service counts, and the facts.
+    :return: What the sweep reached, collected and saw per service.
     """
     inventory_api, tasks_api = await _build_clients()
 
@@ -191,20 +217,46 @@ async def _sweep(observed_at: str) -> tuple[int, int, int, int, list[dict[str, A
         mapped = map_services(services, executor_hosts)
         host_results = await probe_all(tasks_api, mapped)
 
-    facts: list[dict[str, Any]] = []
-    resolved = answered = orphaned = 0
+    outcome = SweepOutcome(total=len(mapped))
     for entry in mapped:
-        if entry.resolution == NodeResolution.ORPHANED:
-            orphaned += 1
-            continue
-        resolved += 1
+        host_result = host_results.get(entry.executor_host or "")
         record = _record_for(entry, host_results)
-        if not record:
-            continue
-        answered += 1
-        facts.extend(build_facts(entry.service, record, observed_at))
+        service_facts = (
+            build_facts(entry.service, record, observed_at) if record else []
+        )
 
-    return len(mapped), resolved, orphaned, answered, facts
+        if entry.resolution == NodeResolution.ORPHANED:
+            outcome.orphaned += 1
+        else:
+            outcome.resolved += 1
+            if record:
+                outcome.answered += 1
+                outcome.facts.extend(service_facts)
+
+        outcome.nodes.append(
+            {
+                # PMM's service UUID, as everywhere else in this app. Null where
+                # inventory holds none, which is also why such a service can
+                # contribute no facts.
+                "service_id": entry.service.external_id,
+                # Carried so a reader is not left joining UUIDs by hand. It is what
+                # the payload echoes back per record, so it is the app's own key too.
+                "service_name": entry.service.name,
+                "executor_host": entry.executor_host,
+                "resolution": str(entry.resolution),
+                "answered": bool(record),
+                # The host's number, repeated on each service it served: one dispatch
+                # covers every target on a host, so there is no per-service time to
+                # report and inventing one would be a lie about what was measured.
+                "duration_seconds": host_result.duration_seconds
+                if host_result
+                else None,
+                "facts_collected": len(service_facts),
+                "error": host_result.error if host_result else None,
+            }
+        )
+
+    return outcome
 
 
 def _terminal_status(resolved: int, answered: int) -> ProbeRunStatus:
@@ -261,22 +313,23 @@ async def run_probe(execution_id: UUID | None = None) -> UUID:
 
     observed_at = utc_now().isoformat()
     try:
-        total, resolved, orphaned, answered, facts = await _sweep(observed_at)
+        outcome = await _sweep(observed_at)
     except Exception as exc:
         logger.exception("POM discovery: sweep %s failed", run_id)
         await _fail_run(run_id, str(exc))
         return run_id
 
-    status = _terminal_status(resolved, answered)
+    status = _terminal_status(outcome.resolved, outcome.answered)
     async with session_maker() as session:
         finished = await ProbeRunManager.get(session, id=run_id)
         finished.status = status
         finished.finished_at = utc_now()
-        finished.services_total = total
-        finished.services_resolved = resolved
-        finished.services_orphaned = orphaned
-        finished.services_answered = answered
-        finished.facts = facts
+        finished.services_total = outcome.total
+        finished.services_resolved = outcome.resolved
+        finished.services_orphaned = outcome.orphaned
+        finished.services_answered = outcome.answered
+        finished.facts = outcome.facts
+        finished.nodes = outcome.nodes
         await ProbeRunManager.save(session, finished)
         await prune_runs(session, pom_discovery_settings.RUN_RETENTION)
 
@@ -284,9 +337,9 @@ async def run_probe(execution_id: UUID | None = None) -> UUID:
         "POM discovery: sweep %s %s -- %d service(s), %d resolved, %d answered, %d fact(s)",
         run_id,
         status,
-        total,
-        resolved,
-        answered,
-        len(facts),
+        outcome.total,
+        outcome.resolved,
+        outcome.answered,
+        len(outcome.facts),
     )
     return run_id

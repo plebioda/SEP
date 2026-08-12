@@ -138,6 +138,55 @@ class ProbeRunResponse(BaseModel):
     error: str | None = None
 
 
+class ProbeNode(BaseModel):
+    """One mapped service, as this sweep saw it.
+
+    The counters on the run are this list's summary; these are the rows behind them.
+    "5 of 14 answered" cannot say which five, on which hosts, or which host took a
+    minute, and every one of those is the first question asked of a slow or partial
+    sweep.
+
+    :param service_id: **PMM's** service UUID, or ``None`` where inventory holds
+        none — which is also why such a service contributes no facts.
+    :param service_name: The service's name, carried so a reader is not left joining
+        UUIDs by hand.
+    :param executor_host: The host its probe ran on; ``None`` when orphaned.
+    :param resolution: ``name`` / ``address`` / ``orphaned`` — how that host was
+        matched, or that it was not.
+    :param answered: Whether the host returned a usable record for this service.
+    :param duration_seconds: The host's wall-clock, dispatch to collected output.
+        Repeated across the services one host serves: a single dispatch covers all of
+        them, so there is no per-service time to report.
+    :param facts_collected: How many facts this service contributed.
+    :param error: The host-level failure, when its probe failed.
+    """
+
+    service_id: str | None = None
+    service_name: str
+    executor_host: str | None = None
+    resolution: str
+    answered: bool
+    duration_seconds: float | None = None
+    facts_collected: int = 0
+    error: str | None = None
+
+
+class ProbeRunDetail(ProbeRunResponse):
+    """One sweep, with everything it recorded.
+
+    Kept apart from the list shape on purpose: a sweep's facts run to a few hundred
+    records, so returning them for every row of a 25-run history would make the list
+    an order of magnitude larger to serve a page that shows one run at a time.
+
+    :param nodes: What the sweep saw per service.
+    :param facts: The facts it collected — every field the probe reads, including the
+        ones no consumer maps today.
+    """
+
+    nodes: list[ProbeNode] = Field(default_factory=list)
+    facts: list[ProbeFact] = Field(default_factory=list)
+
+
 class ProbeRunAccepted(BaseModel):
     """Acknowledge a queued sweep.
 
@@ -228,19 +277,25 @@ async def list_runs(
     return [_run_response(run) for run in await recent_runs(session, limit)]
 
 
-@router.get("/runs/{run_id}", response_model=ProbeRunResponse)
-async def get_probe_run(run_id: UUID, session: SessionDep) -> ProbeRunResponse:
-    """Return one sweep.
+@router.get("/runs/{run_id}", response_model=ProbeRunDetail)
+async def get_probe_run(run_id: UUID, session: SessionDep) -> ProbeRunDetail:
+    """Return one sweep, with its per-service records and its facts.
 
     :param run_id: The sweep's id.
     :param session: The database session.
     :raises HTTPNotFoundException: When there is no such sweep.
-    :return: The sweep.
+    :return: The sweep in full.
     """
     run = await get_run(session, run_id)
     if run is None:
         raise HTTPNotFoundException(detail=f"Probe run {run_id} not found")
-    return _run_response(run)
+    return ProbeRunDetail(
+        **_run_response(run).model_dump(),
+        # Runs recorded before `nodes` existed have none, and answer with an empty
+        # list rather than a 500: an old sweep is still worth its counters.
+        nodes=[ProbeNode(**node) for node in (run.nodes or [])],
+        facts=[ProbeFact(**fact) for fact in (run.facts or [])],
+    )
 
 
 @router.post(
@@ -273,7 +328,7 @@ async def trigger_probe(session: SessionDep) -> ProbeRunAccepted:
 
     # Imported here rather than at module scope: the API process has no reason to load
     # the dispatch stack, and importing celery.py at import time would pull it in.
-    from app.sep.apps.pom_discovery.celery import run_pom_probe  # noqa: PLC0415
+    from app.sep.apps.pom_discovery.celery import run_pom_probe
 
     run_pom_probe.delay(str(run.id))
     return ProbeRunAccepted(

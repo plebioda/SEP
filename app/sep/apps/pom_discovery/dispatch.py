@@ -35,6 +35,7 @@ import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
+from time import monotonic
 from typing import Any
 
 from app.core.requests import RemoteAPI
@@ -65,12 +66,18 @@ class HostProbeResult:
     :param executor_host: The host the payload ran on.
     :param task_history_id: The dispatched run's history id, when dispatch succeeded.
     :param records: The parsed NDJSON records, keyed by service name.
+    :param duration_seconds: Wall-clock from dispatch to collected output, including
+        the wait for Nomad to schedule the job. Measured here rather than read back
+        from the task history because this is the number that explains a slow sweep:
+        a host queued behind a busy client costs the sweep just as much as a slow
+        payload, and the history's own timestamps would hide that wait.
     :param error: The dispatch or collection failure, when the whole host failed.
     """
 
     executor_host: str
     task_history_id: int | None = None
     records: dict[str, dict[str, Any]] = field(default_factory=dict)
+    duration_seconds: float | None = None
     error: str | None = None
 
 
@@ -201,6 +208,9 @@ async def probe_host(
     :return: The host's probe outcome.
     """
     result = HostProbeResult(executor_host=executor_host)
+    # Monotonic: a wall clock stepped by NTP mid-sweep would report a negative
+    # duration, and this number is only ever read as an interval.
+    started = monotonic()
     try:
         created = await tasks_api.post(
             f"/execute/{RUN_PYTHON_TASK}",
@@ -238,6 +248,12 @@ async def probe_host(
     except Exception as err:
         logger.exception("POM discovery: probe of %s failed", executor_host)
         result.error = f"{type(err).__name__}: {err}"
+    finally:
+        # In a finally so a host that failed or returned early is still timed: how
+        # long a broken host took before giving up is as diagnostic as how long a
+        # working one took. Mutating the object the early return already yielded is
+        # visible to the caller -- the return value is this reference.
+        result.duration_seconds = monotonic() - started
     return result
 
 
