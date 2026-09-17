@@ -161,6 +161,10 @@ class TestBuildStep:
             os=OperatingSystem.ROCKY,
             mongodb_version="7.0.14",
             replica_set_name="rs-test",
+            data_path="/var/lib/mongo",
+            log_path="/var/log/mongodb/mongod.log",
+            port=27017,
+            bind_ip="0.0.0.0",
         )
         action = PackagesInstallStrategy().build_step(
             "configure_repository", "node00", spec
