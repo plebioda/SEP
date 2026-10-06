@@ -247,9 +247,9 @@ class BaseExecutor(BaseCaseInsensitiveModel, ABC):
         (nothing to stream yet, answered with a retryable 409) can be handled as
         HTTP error responses.
 
-        Asynchronous because an implementation's validation may be a Nomad read:
-        :meth:`NomadExecutor.preflight_stream_logs` resolves the allocation, and
-        on this branch the job lookup behind it is an aiohttp call.
+        Asynchronous because an implementation's validation may itself be a
+        remote read: :meth:`NomadExecutor.preflight_stream_logs` resolves the
+        allocation, and the job lookup behind it is an aiohttp call.
 
         :param queue_item: The task history record that will be streamed.
         """
