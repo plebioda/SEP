@@ -15,7 +15,10 @@
 
 """Assert reconciliation maps TaskHistory status onto StepRecord, and nothing more."""
 
-from unittest.mock import AsyncMock, patch
+import json
+from collections.abc import AsyncIterator
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import aiohttp
@@ -40,15 +43,73 @@ from app.extensions.apps.om_bootstrap.strategy import (
     StepRecord,
     StepStatus,
 )
+from app.extensions.apps.shared.om.task_failure import MAX_ERROR_DETAIL
+from app.tasks.execution.executors.nomad.models import _failed_step_reason
 from tests.app.extensions.apps.om_bootstrap.factories import BootstrapRunFactory
 
 TASK_HISTORY_ID = 99
 
 
-def _tasks_api(history_status: str) -> AsyncMock:
+def _tasks_api(
+    history_status: str,
+    *,
+    failure_reason: str | None = None,
+    logs: list[str] | None = None,
+    logs_error: Exception | None = None,
+) -> AsyncMock:
+    """Build a Tasks API stub answering one ``TaskHistory`` and its log stream.
+
+    :param history_status: What ``GET /history/{id}`` says the status is.
+    :param failure_reason: Its ``failure_reason``.
+    :param logs: The NDJSON lines ``GET /history/{id}/logs/`` streams.
+    :param logs_error: Raised by the log stream instead of yielding ``logs``.
+    :return: The stub.
+    """
     api = AsyncMock()
-    api.get.return_value = {"status": history_status}
+    api.get.return_value = {"status": history_status, "failure_reason": failure_reason}
+
+    async def stream(path: str, **_: Any) -> AsyncIterator[str]:
+        assert path == f"/history/{TASK_HISTORY_ID}/logs/"
+        if logs_error is not None:
+            raise logs_error
+        for line in logs or []:
+            yield line
+
+    api.stream = MagicMock(side_effect=stream)
     return api
+
+
+def _log_line(stream: str, msg: str, step: str = "run-script") -> str:
+    """Build one line of the Tasks API's log stream.
+
+    :param stream: ``stdout`` or ``stderr``.
+    :param msg: What the step wrote.
+    :param step: The Nomad step that wrote it.
+    :return: The NDJSON line.
+    """
+    return json.dumps({"step": step, "type": stream, "msg": msg})
+
+
+def _xargs_reason() -> str:
+    """Return the reason the executor writes for ``run-script`` exiting 123.
+
+    Built by the executor's own function, so the rewrite in ``reconcile`` is
+    tested against the sentence it really receives.
+
+    :return: The reason.
+    """
+    reason = _failed_step_reason(
+        {
+            "TaskStates": {
+                "run-script": {
+                    "Failed": True,
+                    "Events": [{"Type": "Terminated", "ExitCode": 123}],
+                }
+            }
+        }
+    )
+    assert reason is not None
+    return reason
 
 
 class TestReconcileStep:
@@ -114,6 +175,146 @@ class TestReconcileStep:
         assert result.status == StepStatus.FAILED
         assert result.detail is not None
         assert str(TASK_HISTORY_ID) in result.detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("stream", "msg", "expected"),
+        [
+            (
+                "stderr",
+                "pre_check: /var/lib/mongo has 1.0 GiB free, but the data "
+                "directory /var/lib/mongo needs at least 5 GiB\n",
+                "pre_check: /var/lib/mongo has 1.0 GiB free, but the data "
+                "directory /var/lib/mongo needs at least 5 GiB",
+            ),
+            (
+                "stderr",
+                "Curl error (7): Couldn't connect to server for "
+                "http://repo.percona.com/ [Failed to connect: Connection refused]\n"
+                "Error: Failed to download metadata for repo: All mirrors were tried\n",
+                "Curl error (7): Couldn't connect to server for "
+                "http://repo.percona.com/ [Failed to connect: Connection refused]\n"
+                "Error: Failed to download metadata for repo: All mirrors were tried",
+            ),
+        ],
+    )
+    async def test_a_failed_script_s_detail_is_its_own_output(
+        self, stream: str, msg: str, expected: str
+    ) -> None:
+        """Say why the script failed in its own words, naming the task history.
+
+        Without the tasks service's "Step 'run-script' failed." in front: that names
+        the job's internal step and says only that the script failed, which its
+        output already says.
+
+        :param stream: The stream the step wrote to.
+        :param msg: What it wrote.
+        :param expected: The part of it the detail should carry.
+        """
+        step = StepRecord(
+            name="pre_check", status=StepStatus.RUNNING, task_history_id=TASK_HISTORY_ID
+        )
+        api = _tasks_api(
+            "failed", failure_reason=_xargs_reason(), logs=[_log_line(stream, msg)]
+        )
+
+        result = await reconcile.reconcile_step(api, step)
+
+        assert result.status == StepStatus.FAILED
+        assert result.detail == f"{expected} (task history {TASK_HISTORY_ID})"
+
+    @pytest.mark.asyncio
+    async def test_a_silent_script_s_failure_is_still_said(self) -> None:
+        """Say the script failed when it printed nothing, without ``xargs``' 123."""
+        step = StepRecord(
+            name="pre_check", status=StepStatus.RUNNING, task_history_id=TASK_HISTORY_ID
+        )
+        api = _tasks_api("failed", failure_reason=_xargs_reason())
+
+        result = await reconcile.reconcile_step(api, step)
+
+        assert result.detail == (
+            f"Step 'run-script' failed with no output. (task history {TASK_HISTORY_ID})"
+        )
+
+    @pytest.mark.asyncio
+    async def test_another_step_s_failure_is_reported_from_that_step(self) -> None:
+        """Keep a code other than 123 and read the step the reason names."""
+        step = StepRecord(
+            name="pre_check", status=StepStatus.RUNNING, task_history_id=TASK_HISTORY_ID
+        )
+        api = _tasks_api(
+            "failed",
+            failure_reason="Step 'check-launchable' failed (exit code 1).",
+            logs=[
+                _log_line("stderr", "sudo: not found\n", step="check-launchable"),
+                _log_line("stderr", "unrelated\n"),
+            ],
+        )
+
+        result = await reconcile.reconcile_step(api, step)
+
+        assert result.detail == (
+            "Step 'check-launchable' failed (exit code 1). sudo: not found "
+            f"(task history {TASK_HISTORY_ID})"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_long_output_keeps_its_end_within_the_cap(self) -> None:
+        """Keep the end of a long stderr, where the error is, and bound it."""
+        step = StepRecord(
+            name="start_service",
+            status=StepStatus.RUNNING,
+            task_history_id=TASK_HISTORY_ID,
+        )
+        noise = "journal line\n" * 200
+        error = '"errmsg":"Address already in use"'
+        api = _tasks_api(
+            "failed",
+            failure_reason=_xargs_reason(),
+            logs=[_log_line("stderr", noise + error + "\n")],
+        )
+
+        result = await reconcile.reconcile_step(api, step)
+
+        assert result.detail is not None
+        assert result.detail.endswith(f"{error} (task history {TASK_HISTORY_ID})")
+        assert len(result.detail) <= MAX_ERROR_DETAIL + 100
+
+    @pytest.mark.asyncio
+    async def test_unreadable_logs_still_fail_the_step_with_its_reason(self) -> None:
+        """Fail with the reason alone when the logs cannot be read."""
+        step = StepRecord(
+            name="pre_check", status=StepStatus.RUNNING, task_history_id=TASK_HISTORY_ID
+        )
+        api = _tasks_api(
+            "failed",
+            failure_reason="Step 'run-script' failed (exit code 124).",
+            logs_error=HTTPGoneException(detail="gone"),
+        )
+
+        result = await reconcile.reconcile_step(api, step)
+
+        assert result.status == StepStatus.FAILED
+        assert result.detail == (
+            "Step 'run-script' failed (exit code 124). "
+            f"(task history {TASK_HISTORY_ID})"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_failure_with_nothing_to_say_still_names_its_status(
+        self,
+    ) -> None:
+        """Say how it ended when there is neither a reason nor any output."""
+        step = StepRecord(
+            name="pre_check", status=StepStatus.RUNNING, task_history_id=TASK_HISTORY_ID
+        )
+
+        result = await reconcile.reconcile_step(_tasks_api("lost"), step)
+
+        assert result.detail == (
+            f"Ended lost with no output (task history {TASK_HISTORY_ID})"
+        )
 
     @pytest.mark.asyncio
     async def test_a_lost_dispatch_is_also_treated_as_failed(self) -> None:
