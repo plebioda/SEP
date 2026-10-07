@@ -176,7 +176,18 @@ class TestTriggerRun:
         persistence.
         """
         client = api_client(regular_user, session, _fake_tasks_api())
-        override = {"priority": 0, "votes": False, "hidden": True, "delay_secs": 300}
+        override = {
+            "priority": 0,
+            "votes": False,
+            "hidden": True,
+            "delay_secs": 300,
+            # A concrete address, not None. Raised in review: None would pass even if
+            # a supplied value were dropped by model_dump, persistence or the response
+            # reconstruction -- which is the exact path this test exists to protect,
+            # since PMM reads the echo to tell an older side-car from one that applied
+            # the per-member address.
+            "bind_ip": "10.1.2.3",
+        }
         response = client.post(
             f"{BASE}/runs",
             json={
