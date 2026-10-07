@@ -507,17 +507,24 @@ def build_uri(target, userinfo, auth_source, connect_timeout_ms):
 
 
 def collect_database_facts(target, userinfo, auth_source, connect_timeout_ms):
-    """Return facts read from the database for one target.
+    """Return facts read from the database for one target, or why there are none.
 
-    Each command is run independently so one failure does not lose the others —
-    ``replSetGetStatus`` legitimately fails against a mongos or a standalone, and
-    that must not discard the ``buildInfo`` that came back fine.
+    The database is reached and authenticated against once, up front. Failing that
+    is a target-level failure: the result carries ``error``, ``error_type`` (the
+    exception class name) and ``error_code`` (the server's error code, ``None``
+    where there is none), and no facts.
+
+    Once connected, each command is run independently so one failure does not lose
+    the others — ``replSetGetStatus`` legitimately fails against a mongos or a
+    standalone, and that must not discard the ``buildInfo`` that came back fine.
+    Those failures go to ``command_errors`` and do not fail the target.
 
     :param target: The target mapping carrying ``host`` and ``port``.
     :param userinfo: The credentials prefix.
     :param auth_source: The database to authenticate against.
     :param connect_timeout_ms: Connect and server-selection timeout.
-    :return: A mapping of database facts and per-command errors.
+    :return: A mapping of database facts and per-command errors, or of the
+        target-level ``error``, ``error_type`` and ``error_code``.
     """
     from pymongo import MongoClient
     from pymongo.errors import PyMongoError
@@ -528,6 +535,14 @@ def collect_database_facts(target, userinfo, auth_source, connect_timeout_ms):
     try:
         client = MongoClient(uri)
         admin = client.admin
+        # Connect and authenticate once, before the commands, so failing to reach
+        # the database at all is the target's error rather than four command
+        # errors. ``MongoClient`` is lazy: without this, a refused connection or a
+        # rejected password surfaced only inside the per-command handler below,
+        # the record kept ``status: ok``, and a mongod nobody could query was
+        # stored as freshly and successfully probed. It also waits out one
+        # connect timeout for an unreachable target instead of one per command.
+        admin.command("ping")
         for key, command in (
             ("build_info", "buildInfo"),
             ("hello", "hello"),
@@ -540,6 +555,11 @@ def collect_database_facts(target, userinfo, auth_source, connect_timeout_ms):
                 facts.setdefault("command_errors", {})[key] = str(err)
     except PyMongoError as err:
         facts["error"] = str(err)
+        # Structured beside the text, so the orchestrator can tell a rejected
+        # password (``OperationFailure``, code 18) from an unreachable server
+        # (``ServerSelectionTimeoutError``, no code) without parsing the message.
+        facts["error_type"] = type(err).__name__
+        facts["error_code"] = getattr(err, "code", None)
     finally:
         if client is not None:
             client.close()
@@ -599,14 +619,13 @@ def summarise_database_facts(facts):
         "set_name": hello.get("setName") or repl.get("set"),
         "state": repl.get("myState"),
     }
-    if "error" in facts:
-        summary["error"] = facts["error"]
-    if "command_errors" in facts:
-        summary["command_errors"] = facts["command_errors"]
+    for key in ("error", "error_type", "error_code", "command_errors"):
+        if key in facts:
+            summary[key] = facts[key]
     summary["raw"] = {
         key: value
         for key, value in facts.items()
-        if key not in ("error", "command_errors")
+        if key not in ("error", "error_type", "error_code", "command_errors")
     }
     return summary
 
@@ -667,9 +686,13 @@ def probe(target, config, host_facts, processes=(), versions=None):
         if record["database"].get("error"):
             record["status"] = STATUS_FAILED
             record["error"] = record["database"]["error"]
+            record["error_type"] = record["database"].get("error_type")
+            record["error_code"] = record["database"].get("error_code")
     except Exception as err:  # noqa: BLE001 - one target must not abort the rest
+        error_type = type(err).__name__
         record["status"] = STATUS_FAILED
-        record["error"] = f"{type(err).__name__}: {err}"
+        record["error"] = f"{error_type}: {err}"
+        record["error_type"] = error_type
         record["database"] = None
     return record
 
