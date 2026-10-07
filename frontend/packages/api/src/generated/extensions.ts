@@ -11022,6 +11022,8 @@ export interface components {
       last_attempt_at?: string | null;
       /** Last Error */
       last_error?: string | null;
+      /** Last Error Code */
+      last_error_code?: string | null;
       /** Last Success At */
       last_success_at?: string | null;
       /** Name */
@@ -11297,6 +11299,8 @@ export interface components {
       last_attempt_at?: string | null;
       /** Last Error */
       last_error?: string | null;
+      /** Last Error Code */
+      last_error_code?: string | null;
       /** Last Success At */
       last_success_at?: string | null;
       /** Name */
