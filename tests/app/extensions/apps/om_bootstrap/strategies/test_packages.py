@@ -32,7 +32,6 @@ import yaml
 from app.extensions.apps.om_bootstrap.dispatch import build_step_script
 from app.extensions.apps.om_bootstrap.strategies import packages
 from app.extensions.apps.om_bootstrap.strategies.packages import (
-    _mongosh_eval,
     _mongosh_eval_command,
     _with_loopback,
     CONFIG_PATH,
@@ -105,6 +104,10 @@ _STEP_PARAMS: dict[str, dict[str, str]] = {
 }
 
 _SH = shutil.which("sh") or "/bin/sh"
+
+_REFUSED = "MongoNetworkError: connect ECONNREFUSED 127.0.0.1:27017"
+#: Which ping the stand-in mongod first answers in the readiness-wait tests.
+_ANSWERS_ON = 3
 
 
 def _body(command: list[str]) -> str:
@@ -494,8 +497,9 @@ class TestBuildStep:
         )
 
         ping = _mongosh_eval_command("db.adminCommand('ping').ok", 27017)
-        assert f"{ping} || rc=$?" in _body(action.command)
-        assert action.timeout_s == _mongosh_eval("", 27017).timeout_s
+        body = _body(action.command)
+        assert ping in body
+        assert f"{ping}; }} || rc=$?" in body
 
     def test_pre_check_looks_for_mongod_outside_sudo_s_path(self) -> None:
         """Look where a tarball mongod lands, which ``sudo``'s PATH leaves out."""
@@ -534,6 +538,22 @@ class TestBuildStep:
         assert "journalctl -u mongod --no-pager -n 20 >&2" in body
         assert "/var/log/mongodb/mongod.log" in body
         assert 'om_mongod_why; exit "$rc"' in body
+
+    def test_verify_waits_for_mongod_to_answer(self, tmp_path: Path) -> None:
+        """Pass once mongod answers, not only when it already does.
+
+        On PSMDB 8.0 ``start_service`` returns before mongod listens.
+        """
+        action = PackagesInstallStrategy().build_step(
+            "verify", "node00", _spec(OperatingSystem.UBUNTU)
+        )
+
+        result = _run_against_slow_mongod(
+            action.command[-1], tmp_path, answers_on=_ANSWERS_ON
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert int((tmp_path / "pings").read_text()) >= _ANSWERS_ON
 
 
 class TestPlanRunSteps:
@@ -881,6 +901,68 @@ class TestBuildFinalizeStep:
 
         assert result.returncode != 0
         assert not marker.exists()
+
+
+def _run_against_slow_mongod(
+    script: str, tmp_path: Path, *, answers_on: int | None
+) -> subprocess.CompletedProcess[str]:
+    """Run a step's script with ``systemctl`` and ``mongosh`` stood in for.
+
+    :param script: The step's ``sh -c`` body.
+    :param tmp_path: Where the stand-in config file and ping count live.
+    :param answers_on: Which ping mongod first answers, or ``None`` for never.
+    :return: The finished process.
+    """
+    pings = shlex.quote(str(tmp_path / "pings"))
+    answer = (
+        f'[ "$n" -ge {answers_on} ] && echo 1 && return 0; '
+        if answers_on is not None
+        else ""
+    )
+    stubs = (
+        "systemctl() { :; }\n"
+        f"mongosh() {{ n=$(( $(cat {pings} 2>/dev/null || echo 0) + 1 )); "
+        f"echo $n > {pings}; {answer}echo '{_REFUSED}' >&2; return 1; }}\n"
+    )
+    rigged = script.replace(CONFIG_PATH, str(tmp_path / "mongod.conf"))
+    return subprocess.run(
+        ["sh", "-c", stubs + rigged], capture_output=True, text=True, check=False
+    )
+
+
+class TestReadinessWait:
+    """Assert enable_auth waits for the restarted mongod rather than pinging once."""
+
+    def test_enable_auth_succeeds_once_mongod_answers(self, tmp_path: Path) -> None:
+        """Keep pinging while mongod is still starting.
+
+        PSMDB 8.0's unit returns from ``systemctl restart`` before mongod listens.
+        """
+        action = PackagesInstallStrategy().build_finalize_step(
+            "enable_auth", "node00", _spec(OperatingSystem.UBUNTU)
+        )
+
+        result = _run_against_slow_mongod(
+            action.command[-1], tmp_path, answers_on=_ANSWERS_ON
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert int((tmp_path / "pings").read_text()) >= _ANSWERS_ON
+        assert "authorization: enabled" in (tmp_path / "mongod.conf").read_text()
+
+    def test_enable_auth_fails_with_mongoshs_error_when_mongod_never_answers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Give up after the wait, saying what the last ping was told."""
+        monkeypatch.setattr(packages, "MONGOD_READY_WAIT_S", 2)
+        action = PackagesInstallStrategy().build_finalize_step(
+            "enable_auth", "node00", _spec(OperatingSystem.UBUNTU)
+        )
+
+        result = _run_against_slow_mongod(action.command[-1], tmp_path, answers_on=None)
+
+        assert result.returncode != 0
+        assert _REFUSED in result.stderr
 
 
 class TestPlanRollbackSteps:
@@ -1338,6 +1420,11 @@ _LISTENER_ERROR = (
 class TestMongodDiagnostics:
     """Run start_service and verify for real, with a mongod that will not come up."""
 
+    @pytest.fixture(autouse=True)
+    def _short_wait(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Keep verify's wait for a mongod that never answers to a second."""
+        monkeypatch.setattr(packages, "MONGOD_READY_WAIT_S", 1)
+
     def _run(
         self,
         tmp_path: Path,
@@ -1361,7 +1448,7 @@ class TestMongodDiagnostics:
         action = PackagesInstallStrategy().build_step(step_name, "node00", spec)
         bin_dir = tmp_path / "bin"
         bin_dir.mkdir()
-        for tool in ("tail", "grep"):
+        for tool in ("tail", "grep", "date", "sleep"):
             real = shutil.which(tool)
             assert real is not None
             (bin_dir / tool).symlink_to(real)
