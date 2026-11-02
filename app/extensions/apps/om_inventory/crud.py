@@ -520,6 +520,7 @@ async def claim_run(session: AsyncSession, run_id: UUID, boot_id: UUID) -> bool:
 
     A run :func:`reap_interrupted_runs` failed while its message was still queued is
     taken back and set running again: the delivery proves the scan is still wanted.
+    It starts again from now, so it yields to any scan admitted while it was failed.
 
     :param session: The database session.
     :param run_id: The run to claim.
@@ -527,26 +528,30 @@ async def claim_run(session: AsyncSession, run_id: UUID, boot_id: UUID) -> bool:
     :return: Whether the run was claimed. ``False`` when another boot claimed it, or
         it finished or failed for any other reason.
     """
-    claimed = await ProbeRunManager.update_where(
+    unclaimed = (col(ProbeRun.id) == run_id, col(ProbeRun.worker_boot_id).is_(None))
+    if await ProbeRunManager.update_where(
+        session,
+        {"worker_boot_id": boot_id},
+        *unclaimed,
+        col(ProbeRun.status) == ProbeRunStatus.RUNNING,
+        returning=["id"],
+    ):
+        return True
+    taken_back = await ProbeRunManager.update_where(
         session,
         {
             "worker_boot_id": boot_id,
             "status": ProbeRunStatus.RUNNING,
+            "started_at": utc_now(),
             "finished_at": None,
             "error": None,
         },
-        col(ProbeRun.id) == run_id,
-        col(ProbeRun.worker_boot_id).is_(None),
-        or_(
-            col(ProbeRun.status) == ProbeRunStatus.RUNNING,
-            and_(
-                col(ProbeRun.status) == ProbeRunStatus.FAILED,
-                col(ProbeRun.error) == RESTARTED_DETAIL,
-            ),
-        ),
+        *unclaimed,
+        col(ProbeRun.status) == ProbeRunStatus.FAILED,
+        col(ProbeRun.error) == RESTARTED_DETAIL,
         returning=["id"],
     )
-    return bool(claimed)
+    return bool(taken_back)
 
 
 async def reap_interrupted_runs(
@@ -562,8 +567,8 @@ async def reap_interrupted_runs(
 
     :param session: The database session.
     :param boot_id: This worker's boot id.
-    :param unclaimed_before: Fail unclaimed rows created before this, too; ``None``
-        leaves every unclaimed row alone.
+    :param unclaimed_before: Fail unclaimed rows created no later than this, too;
+        ``None`` leaves every unclaimed row alone.
     :return: The ids of the runs failed.
     """
     lost = col(ProbeRun.worker_boot_id) != boot_id
@@ -572,7 +577,7 @@ async def reap_interrupted_runs(
             lost,
             and_(
                 col(ProbeRun.worker_boot_id).is_(None),
-                col(ProbeRun.started_at) < unclaimed_before,
+                col(ProbeRun.started_at) <= unclaimed_before,
             ),
         )
     # Not ``update_where``: its session sync evaluates the condition in Python, where

@@ -33,10 +33,11 @@ import pytest
 from httpx import AsyncClient
 from kombu.exceptions import OperationalError as KombuOperationalError
 from sqlalchemy.exc import DBAPIError, IntegrityError, ProgrammingError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlmodel.ext.asyncio.session import AsyncSession
 from starlette import status
 
-from app.core.utils.date_time import utc_now
+from app.core.utils.date_time import make_datetime_utc, utc_now
 from app.extensions.apps.om_inventory import celery as celery_module
 from app.extensions.apps.om_inventory import service as service_module
 from app.extensions.apps.om_inventory.api_routes import QUEUE_UNAVAILABLE_DETAIL
@@ -101,7 +102,10 @@ async def _runs_left_by_restarts(
         "other boot": ProbeRun(worker_boot_id=uuid4(), started_at=before),
         "this boot": ProbeRun(worker_boot_id=boot.boot_id, started_at=before),
         "unclaimed before boot": ProbeRun(started_at=before),
-        "unclaimed since boot": ProbeRun(started_at=boot.booted_at),
+        "unclaimed in the boot's second": ProbeRun(started_at=boot.booted_at),
+        "unclaimed since boot": ProbeRun(
+            started_at=boot.booted_at + timedelta(seconds=1)
+        ),
         "finished": ProbeRun(
             worker_boot_id=uuid4(), started_at=before, status=ProbeRunStatus.SUCCESS
         ),
@@ -137,9 +141,13 @@ async def _assert_reaped(
             assert stored.status is run.status, kind
 
 
+#: The unclaimed runs a settled boot fails: timestamps are whole seconds, so one
+#: from the boot's own second may be older than it.
+UNCLAIMED_REAPED = {"unclaimed before boot", "unclaimed in the boot's second"}
+
 #: The runs failed with and without the unclaimed ones older than the boot.
 REAPED = [
-    pytest.param(True, {"other boot", "unclaimed before boot"}, id="with-unclaimed"),
+    pytest.param(True, {"other boot", *UNCLAIMED_REAPED}, id="with-unclaimed"),
     pytest.param(False, {"other boot"}, id="claimed-only"),
 ]
 
@@ -192,7 +200,7 @@ class TestReapInterruptedRuns:
         )
 
         await _assert_reaped(
-            postgres_session, runs, reaped, {"other boot", "unclaimed before boot"}
+            postgres_session, runs, reaped, {"other boot", *UNCLAIMED_REAPED}
         )
 
 
@@ -203,17 +211,19 @@ class TestClaimRun:
     async def test_an_unclaimed_running_run_is_claimed(
         self, session: AsyncSession, boot: WorkerBoot
     ) -> None:
-        """Stamp the run with this boot.
+        """Stamp the run with this boot and keep its start time.
 
         :param session: The database session.
         :param boot: This worker's boot.
         """
-        run = await ProbeRunManager.save(session, ProbeRun())
+        started = utc_now() - timedelta(hours=1)
+        run = await ProbeRunManager.save(session, ProbeRun(started_at=started))
 
         assert await claim_run(session, run.id, boot.boot_id)
 
         stored = await ProbeRunManager.get(session, id=run.id)
         assert stored.worker_boot_id == boot.boot_id
+        assert make_datetime_utc(stored.started_at) == started
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -265,7 +275,7 @@ class TestClaimRun:
     async def test_a_run_reaped_before_its_message_arrived_is_taken_back(
         self, session: AsyncSession, boot: WorkerBoot
     ) -> None:
-        """Claim a never-started run failed as restarted, and set it running again.
+        """Claim a never-started run failed as restarted, and start it again now.
 
         Its message survived a restart of the worker alone and arrived after the
         reaper gave up on it: the delivery proves the scan is still wanted.
@@ -276,11 +286,13 @@ class TestClaimRun:
         run = await ProbeRunManager.save(
             session,
             ProbeRun(
+                started_at=utc_now() - timedelta(hours=1),
                 status=ProbeRunStatus.FAILED,
                 error=RESTARTED_DETAIL,
                 finished_at=utc_now(),
             ),
         )
+        claimed_at = utc_now()
 
         assert await claim_run(session, run.id, boot.boot_id)
 
@@ -291,6 +303,7 @@ class TestClaimRun:
             None,
         )
         assert stored.worker_boot_id == boot.boot_id
+        assert make_datetime_utc(stored.started_at) >= claimed_at
 
     @pytest.mark.postgres
     @pytest.mark.asyncio
@@ -473,6 +486,45 @@ class TestRunProbeRecoversBeforeItSweeps:
         await run_probe(execution_id=run.id)
 
         assert swept.await_count == sweeps
+
+    @pytest.mark.asyncio
+    async def test_a_run_taken_back_yields_to_a_scan_admitted_since(
+        self, service_session: AsyncSession, boot: WorkerBoot, swept: AsyncMock
+    ) -> None:
+        """Skip a run taken back late when a newer scan of the same hosts is sweeping.
+
+        The newer scan was admitted while the late run was failed, so it never saw it.
+
+        :param service_session: The session every sweep function opens.
+        :param boot: This worker's boot.
+        :param swept: The stubbed sweep.
+        """
+        started = utc_now() - timedelta(minutes=10)
+        late = await ProbeRunManager.save(
+            service_session,
+            ProbeRun(
+                started_at=started,
+                status=ProbeRunStatus.FAILED,
+                error=RESTARTED_DETAIL,
+                finished_at=utc_now(),
+            ),
+        )
+        sweeping = await ProbeRunManager.save(
+            service_session,
+            ProbeRun(
+                started_at=started + timedelta(minutes=5), worker_boot_id=boot.boot_id
+            ),
+        )
+
+        await run_probe(execution_id=late.id)
+
+        swept.assert_not_awaited()
+        assert (await ProbeRunManager.get(service_session, id=late.id)).status is (
+            ProbeRunStatus.SKIPPED
+        )
+        assert (
+            await ProbeRunManager.get(service_session, id=sweeping.id)
+        ).status is ProbeRunStatus.RUNNING
 
     @pytest.mark.asyncio
     async def test_the_sweep_is_told_its_run(
@@ -718,6 +770,14 @@ class TestDatabaseUnreachable:
             pytest.param(_DriverError("57P03"), True, id="starting-up-raw"),
             pytest.param(_wrapped(_DriverError("57P01")), True, id="shut-down"),
             pytest.param(_wrapped(_DriverError("08006")), True, id="connection-lost"),
+            pytest.param(
+                _wrapped(_DriverError("53300")), True, id="too-many-connections"
+            ),
+            pytest.param(
+                SQLAlchemyTimeoutError("QueuePool limit reached"),
+                True,
+                id="no-pooled-connection",
+            ),
             pytest.param(
                 _wrapped(Exception("closed"), invalidated=True), True, id="invalidated"
             ),

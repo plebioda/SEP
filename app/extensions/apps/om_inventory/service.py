@@ -42,6 +42,7 @@ from uuid import UUID, uuid4
 
 from aiohttp import ClientConnectionError
 from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.config import settings
@@ -102,9 +103,10 @@ logger = logging.getLogger(__name__)
 SWITCHED_OFF_DETAIL = "Operations Inventory is switched off"
 """Why a sweep was refused while ``ENABLED`` is off, on the run row and the 503 alike."""
 
-#: PostgreSQL SQLSTATEs for a server that is shutting down or not yet accepting
-#: connections. Class ``08`` (connection exception) is matched by prefix.
-_SERVER_UNAVAILABLE_SQLSTATES = frozenset({"57P01", "57P02", "57P03"})
+#: PostgreSQL SQLSTATEs for a server that is shutting down, not yet accepting
+#: connections, or out of connection slots. Class ``08`` (connection exception) is
+#: matched by prefix.
+_SERVER_UNAVAILABLE_SQLSTATES = frozenset({"53300", "57P01", "57P02", "57P03"})
 
 #: ``OSError`` kinds that mean the connection is misconfigured, not that the database
 #: is away: retrying them only repeats the failure.
@@ -123,9 +125,10 @@ def database_unreachable(exc: BaseException) -> bool:
     True while PMM Server, which hosts the database, restarts: worth retrying, unlike
     any other error. That is any network error, a refused connection, an unreachable
     host or a failed lookup alike, except one that says the connection is
-    misconfigured; a connection SQLAlchemy found gone; or a PostgreSQL connection or
-    shutdown SQLSTATE. The cause chain is walked because the driver's error reaches
-    the caller wrapped, or raw when the connection was refused while opening.
+    misconfigured; a connection SQLAlchemy found gone, or none free in its pool in
+    time; or a PostgreSQL connection, shutdown or too-many-connections SQLSTATE. The
+    cause chain is walked because the driver's error reaches the caller wrapped, or
+    raw when the connection was refused while opening.
 
     :param exc: The error a database call raised.
     :return: Whether retrying once the database is back could succeed.
@@ -138,6 +141,7 @@ def database_unreachable(exc: BaseException) -> bool:
         if (
             (isinstance(link, OSError) and not isinstance(link, _MISCONFIGURED))
             or (isinstance(link, DBAPIError) and link.connection_invalidated)
+            or isinstance(link, SQLAlchemyTimeoutError)
             or sqlstate in _SERVER_UNAVAILABLE_SQLSTATES
             or sqlstate.startswith("08")
         ):
