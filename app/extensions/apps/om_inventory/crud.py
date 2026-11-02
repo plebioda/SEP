@@ -42,6 +42,16 @@ from app.extensions.apps.om_inventory.models import (
     ScanFailure,
 )
 
+RUN_LEASE = timedelta(minutes=2)
+"""How long a running run may go without a write before it is presumed dead. A live
+sweep writes its run at least every ``service.HEARTBEAT_INTERVAL``."""
+
+INTERRUPTED_DETAIL = (
+    "interrupted: the scan stopped reporting, most likely because PMM Extensions or "
+    "PMM Server restarted"
+)
+"""Why :func:`conflicting_run` failed a run whose lease ran out."""
+
 
 class ProbeRunManager(BaseSQLModelManager):
     """Manage :class:`ProbeRun` CRUD operations.
@@ -512,6 +522,38 @@ async def prune_runs(session: AsyncSession, keep: int) -> int:
     return int(result.rowcount or 0)
 
 
+async def touch_run(session: AsyncSession, run_id: UUID) -> None:
+    """Record that a running run's sweep is alive, for :func:`conflicting_run`.
+
+    :param session: The database session.
+    :param run_id: The run.
+    """
+    await ProbeRunManager.update_where(
+        session,
+        {"updated_at": utc_now()},
+        col(ProbeRun.id) == run_id,
+        col(ProbeRun.status) == ProbeRunStatus.RUNNING,
+    )
+
+
+async def fail_running_run(session: AsyncSession, run_id: UUID, error: str) -> bool:
+    """Fail a run, unless it already reached a terminal status.
+
+    :param session: The database session.
+    :param run_id: The run to fail.
+    :param error: The failure detail.
+    :return: Whether the run was still running and is now failed.
+    """
+    failed = await ProbeRunManager.update_where(
+        session,
+        {"status": ProbeRunStatus.FAILED, "finished_at": utc_now(), "error": error},
+        col(ProbeRun.id) == run_id,
+        col(ProbeRun.status) == ProbeRunStatus.RUNNING,
+        returning=["id"],
+    )
+    return bool(failed)
+
+
 async def conflicting_run(
     session: AsyncSession,
     node_ids: list[str] | None,
@@ -533,9 +575,12 @@ async def conflicting_run(
     and the Tasks layer would refuse the duplicate with a 409 recorded against a host
     that is perfectly healthy.
 
-    A run older than ``stale_after`` is reaped rather than honoured, because a crashed
-    worker leaves a row nothing else advances and it would otherwise wedge the app
-    permanently.
+    A run with no write for :data:`RUN_LEASE` is reaped rather than honoured: its
+    sweep is gone, whether its worker was killed or restarted, or PMM Server's
+    restart took the database it would have written its failure to. One older than
+    ``stale_after`` is reaped too, however alive, so a sweep that never ends cannot
+    wedge the app permanently. Both writes are guarded, so a run that finishes in
+    between keeps its own status.
 
     **The check is not atomic**, and where ``exclude`` is given it does not need to be.
     Creating the row and claiming the work are two statements, so two callers can both
@@ -564,12 +609,17 @@ async def conflicting_run(
     for in_flight in await running_runs(session):
         if exclude is not None and in_flight.id == exclude:
             continue
+        last_write = in_flight.updated_at or in_flight.created_at
+        if utc_now() - make_datetime_utc(last_write) >= RUN_LEASE:
+            await fail_running_run(session, in_flight.id, INTERRUPTED_DETAIL)
+            continue
         age = utc_now() - make_datetime_utc(in_flight.started_at)
         if age >= stale_after:
-            in_flight.status = ProbeRunStatus.FAILED
-            in_flight.finished_at = utc_now()
-            in_flight.error = "abandoned: no worker recorded a terminal status"
-            await ProbeRunManager.save(session, in_flight)
+            await fail_running_run(
+                session,
+                in_flight.id,
+                "abandoned: no worker recorded a terminal status",
+            )
             continue
         if not in_flight.scope or not wanted or (set(in_flight.scope) & wanted):
             if own is not None and _claimed_first(own, in_flight):
