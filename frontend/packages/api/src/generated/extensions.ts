@@ -2415,6 +2415,12 @@ export interface paths {
      *     survives the switch being turned off and back on. The change lands without a
      *     restart, the same way an admin's change on the settings router does.
      *
+     *     Switching on also sweeps the whole estate at once, so it need not wait out a
+     *     ``SCHEDULE`` interval, unless another sweep is in flight or ``AUTO_SCAN`` is off:
+     *     pmm-managed switches on at every start, and an admin who stopped automatic
+     *     scans should not get one from a restart. A sweep that cannot be queued does not
+     *     fail the switch, which has already landed.
+     *
      *     :param request: The incoming request; its ``app.state`` carries the rebind
      *         callbacks fired for ``ENABLED``.
      *     :param body: The switch's new state.
