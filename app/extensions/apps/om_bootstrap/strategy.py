@@ -47,6 +47,7 @@ from pydantic import BaseModel, Field, model_validator
 from app.core.utils.fields import UTCDatetime
 
 __all__ = [
+    "ROOTLESS_RECORD_PATH",
     "BootstrapSpec",
     "HostBootstrapState",
     "InstallMethod",
@@ -57,6 +58,12 @@ __all__ = [
     "StepRecord",
     "StepStatus",
 ]
+
+#: Written by the one-time root step that lets a pmm-agent that is not root install
+#: MongoDB: what it granted, root-owned. A host carrying it runs every step's
+#: :attr:`StepAction.rootless_command`, whoever the agent runs as, and needs neither
+#: root nor ``sudo``.
+ROOTLESS_RECORD_PATH = "/etc/pmm-agent/operations.conf"
 
 
 class StepStatus(StrEnum):
@@ -215,15 +222,20 @@ class StepAction(BaseModel):
     into a real Nomad job, has exactly one shape to consume regardless of which
     strategy planned it.
 
-    :param command: The argv to run on the host. An ``["sh", "-c", body]`` argv
-        is run as ``body`` directly (see
+    :param command: The argv to run on the host, as root. An ``["sh", "-c", body]``
+        argv is run as ``body`` directly (see
         :func:`~app.extensions.apps.om_bootstrap.dispatch.build_step_script`).
     :param timeout_s: How long the step may run, in seconds, before it is killed
         and fails.
+    :param rootless_command: The argv to run instead on a host carrying
+        :data:`ROOTLESS_RECORD_PATH`, as whoever the agent runs as, through the
+        grants that record describes. ``None`` when ``command`` itself needs no
+        root, so it runs on both kinds of host.
     """
 
     command: list[str]
     timeout_s: int = 120
+    rootless_command: list[str] | None = None
 
 
 class StepRecord(BaseModel):

@@ -16,6 +16,7 @@
 """Assert step scripts render correctly and dispatch reaches the Tasks API right."""
 
 import hashlib
+import os
 import shutil
 import stat
 import subprocess
@@ -36,11 +37,24 @@ PRIVATE_FILE_MODE = 0o600
 PRIVATE_DIR_MODE = 0o700
 
 
+def _as_root(tmp_path: Path) -> dict[str, str]:
+    """Return an environment whose ``id`` reports root, so a script skips ``sudo``."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    fake_id = bin_dir / "id"
+    fake_id.write_text("#!/bin/sh\necho 0\n")
+    fake_id.chmod(0o755)
+    return {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
+
+
 def _preamble(timeout_s: int) -> str:
     """Return the fixed head every step script starts with."""
     return (
         "#!/bin/sh\n"
         "set -eu\n"
+        'if [ ! -e /etc/pmm-agent/operations.conf ] && [ "$(id -u)" != 0 ]; then\n'
+        '  exec sudo -n bash "$0"\n'
+        "fi\n"
         'if [ -z "${OM_BOOTSTRAP_STEP_TIMED:-}" ]; then\n'
         "  export OM_BOOTSTRAP_STEP_TIMED=1\n"
         f'  exec timeout --kill-after=10 {timeout_s} sh "$0"\n'
@@ -82,7 +96,11 @@ class TestBuildStepScript:
         )
 
         result = subprocess.run(
-            ["sh", str(script)], capture_output=True, timeout=30, check=False
+            ["sh", str(script)],
+            capture_output=True,
+            timeout=30,
+            check=False,
+            env=_as_root(tmp_path),
         )
 
         assert result.returncode == TIMED_OUT_EXIT
@@ -95,10 +113,39 @@ class TestBuildStepScript:
         )
 
         result = subprocess.run(
-            ["sh", str(script)], capture_output=True, text=True, timeout=30, check=True
+            ["sh", str(script)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+            env=_as_root(tmp_path),
         )
 
         assert result.stdout == "ran\n"
+
+    def test_runs_the_rootless_command_only_on_a_host_with_the_record(
+        self, tmp_path: Path
+    ) -> None:
+        """Pick the body on the host, from the root step's record, not at dispatch."""
+        action = StepAction(
+            command=["echo", "as root"], rootless_command=["echo", "rootless"]
+        )
+        script = tmp_path / "step.sh"
+        script.write_text(dispatch.build_step_script(action))
+
+        result = subprocess.run(
+            ["sh", str(script)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=True,
+            env=_as_root(tmp_path),
+        )
+
+        assert "if [ -e /etc/pmm-agent/operations.conf ]; then\necho rootless\n" in (
+            script.read_text()
+        )
+        assert result.stdout == "as root\n"
 
     def test_quotes_arguments_containing_spaces(self) -> None:
         """Keep an argument with a space as one argument, not two."""
@@ -250,13 +297,13 @@ class TestDispatchStep:
         assert result == FAKE_TASK_HISTORY_ID
 
     @pytest.mark.asyncio
-    async def test_posts_with_the_root_interpreter(self) -> None:
-        """Ask for root in the dispatch, not the Nomad agent's own user."""
+    async def test_posts_with_a_plain_interpreter(self) -> None:
+        """Leave elevation to the script, which knows whether the host has the root step."""
         _result, post = await self._dispatch(StepAction(command=["true"]))
 
         _tasks_api, task_name, meta = post.call_args.args
         assert task_name == dispatch.EXEC_ARTIFACT_TASK
-        assert meta.interpreter == dispatch.ROOT_INTERPRETER
+        assert meta.interpreter == dispatch.STEP_INTERPRETER
         assert meta.target == "node00"
 
     @pytest.mark.asyncio

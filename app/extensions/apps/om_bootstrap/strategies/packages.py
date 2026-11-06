@@ -41,6 +41,15 @@ before installing anything, and every rollback step is a no-op on a host whose
 marker does not hold this run's id. The marker outlives a successful run, so a
 later run that fails ``pre_check`` on the same host and rolls back leaves the
 earlier run's MongoDB intact.
+
+Every step that needs root also carries a ``rootless_command``, which a host
+carrying :data:`~app.extensions.apps.om_bootstrap.strategy.ROOTLESS_RECORD_PATH`
+runs instead, as the agent's own user, through what the one-time root step set up
+there: PackageKit and a polkit rule for the packages, and a ``pmm-mongod@<port>``
+unit that runs as ``mongod`` and reads its config and keyFile from
+:data:`HANDOVER_DIR`. That host gets a different layout: no ``/etc/mongod.conf``,
+no ``mongod.service``, one instance per port, and the ownership marker in the
+instance's own hand-over directory.
 """
 
 import base64
@@ -54,6 +63,7 @@ from app.extensions.apps.om_bootstrap.strategy import (
     HostBootstrapState,
     MemberConfig,
     OperatingSystem,
+    ROOTLESS_RECORD_PATH,
     StepAction,
     StepStatus,
 )
@@ -193,6 +203,21 @@ LOOPBACK_ADDRESS = "127.0.0.1"
 #: must never get it added: beside ``127.0.0.1``, mongod refuses to start with
 #: ``0.0.0.0`` (``Address already in use``) and listens on loopback alone with ``*``.
 _REACHES_LOOPBACK = frozenset({"0.0.0.0", "*", LOOPBACK_ADDRESS, "localhost"})  # noqa: S104 # nosec B104
+
+#: On a host with the root step: one ``<port>`` directory per instance, setgid group
+#: ``mongod``, where the agent writes the instance's ``mongod.conf``, ``keyfile``,
+#: ``dirs`` (directories the unit creates as ``mongod``) and ``purge`` (what
+#: ``pmm-mongod-purge@<port>`` deletes), plus the ownership marker and the
+#: ``enabled`` file the boot starter reads.
+HANDOVER_DIR = "/var/lib/pmm-agent/mongod"
+
+#: Where ``pmm-mongod@<port>`` copies the keyFile to, as ``mongod`` and mode 400:
+#: mongod refuses a keyFile its group can read, which the hand-over copy must be.
+ROOTLESS_KEY_FILE_PATH = "/run/mongodb/pmm-{port}/keyfile"
+
+#: Where ``pmm-mongod@<port>`` leaves the last error lines of mongod's log when it
+#: stops on a failure, readable by the agent.
+ROOTLESS_LAST_ERROR_PATH = "/run/mongodb/pmm-{port}/last-error"
 
 
 def _psmdb_channel(mongodb_version: str) -> str:
@@ -362,7 +387,39 @@ def _port_free_check(port: int) -> str:
     )
 
 
-def _mongod_diagnostics(spec: BootstrapSpec) -> str:
+def _disk_space_check(spec: BootstrapSpec) -> str:
+    """Build the ``pre_check`` lines refusing a data path with too little free space.
+
+    Measured on the nearest existing ancestor of ``spec.data_path``: on a fresh
+    host the path itself does not exist yet, and one the agent cannot look into
+    counts as absent, so its parent is measured, which ``statfs`` allows.
+
+    :param spec: The host's bootstrap spec; its data path is read.
+    :return: The shell lines.
+    """
+    data_path = shlex.quote(spec.data_path)
+    return "\n".join(
+        [
+            f"target={data_path}",
+            'while [ ! -d "$target" ]; do target="$(dirname "$target")"; done',
+            'avail=$(df --output=avail -B1 "$target" | tail -1)',
+            (
+                "case \"$avail\" in ''|*[!0-9]*) "
+                'echo "pre_check: could not measure free space at $target" >&2; '
+                "exit 1;; esac"
+            ),
+            f"tenths=$((avail * 10 / {GIB}))",
+            (
+                f'if [ "$avail" -lt {MIN_DATA_DISK_BYTES} ]; then '
+                f'echo "pre_check: the data directory "{data_path}" needs at least '
+                f"{MIN_DATA_DISK_BYTES // GIB} GiB free, but $target has "
+                '$((tenths / 10)).$((tenths % 10)) GiB" >&2; exit 1; fi'
+            ),
+        ]
+    )
+
+
+def _mongod_diagnostics(spec: BootstrapSpec, *, rootless: bool = False) -> str:
     """Build a shell function printing why ``mongod`` did not come up, to stderr.
 
     A failed ``systemctl restart`` says only "see journalctl", and a failed
@@ -379,9 +436,32 @@ def _mongod_diagnostics(spec: BootstrapSpec) -> str:
     No part can fail the step: it is already failing, and the exit code that says
     so is the command's, not this function's.
 
-    :param spec: The host's bootstrap spec; its log path is read.
+    On a host with the root step the agent can read neither the journal nor
+    mongod's log as a rule. There the unit's result and exit code come first,
+    readable by anyone, then the last errors the unit saved from mongod's log when
+    it stopped (:data:`ROOTLESS_LAST_ERROR_PATH`).
+
+    :param spec: The host's bootstrap spec; its log path and port are read.
+    :param rootless: Whether the step runs on a host with the root step.
     :return: The shell function definition, called ``om_mongod_why``.
     """
+    awk = shlex.quote(_MONGOD_LOG_AWK)
+    if rootless:
+        last_error = shlex.quote(ROOTLESS_LAST_ERROR_PATH.format(port=spec.port))
+        return "\n".join(
+            [
+                "om_mongod_why() {",
+                '  echo "mongod did not come up; its unit and log say:" >&2',
+                (
+                    "  systemctl show -p Result -p ExecMainStatus"
+                    f" {_rootless_unit(spec)} >&2 || true"
+                ),
+                f"  if [ -r {last_error} ]; then",
+                f"    awk {awk} {last_error} >&2 || true",
+                "  fi",
+                "}",
+            ]
+        )
     log = shlex.quote(spec.log_path)
     return "\n".join(
         [
@@ -394,7 +474,7 @@ def _mongod_diagnostics(spec: BootstrapSpec) -> str:
             ),
             "  fi",
             f"  if [ -r {log} ]; then",
-            f"    tail -n 200 {log} | awk {shlex.quote(_MONGOD_LOG_AWK)} >&2 || true",
+            f"    tail -n 200 {log} | awk {awk} >&2 || true",
             "  fi",
             "}",
         ]
@@ -420,7 +500,9 @@ def _run_or_explain(command: str) -> str:
     )
 
 
-def _mongod_config(spec: BootstrapSpec, host: str, *, with_auth: bool) -> str:
+def _mongod_config(
+    spec: BootstrapSpec, host: str, *, with_auth: bool, rootless: bool = False
+) -> str:
     """Render ``mongod.conf``'s contents, with or without the security block.
 
     Shared by :meth:`PackagesInstallStrategy._configure_mongod` (``with_auth=False``,
@@ -434,13 +516,24 @@ def _mongod_config(spec: BootstrapSpec, host: str, *, with_auth: bool) -> str:
     :param host: The host this config is for, which decides its ``bindIp``: a
         member may name its own, and the run-level value applies to the rest.
     :param with_auth: Whether to include ``security.authorization``/``keyFile``.
+    :param rootless: Whether the config is for ``pmm-mongod@<port>`` on a host
+        with the root step, which runs mongod in the foreground as ``mongod``: no
+        ``fork`` or pid file, and the keyFile where that unit copies it.
     :return: The full config file contents, including a trailing newline on the
         last section.
     """
+    key_file = (
+        ROOTLESS_KEY_FILE_PATH.format(port=spec.port) if rootless else KEY_FILE_PATH
+    )
     security = (
-        f"security:\n  authorization: enabled\n  keyFile: {KEY_FILE_PATH}\n"
+        f"security:\n  authorization: enabled\n  keyFile: {key_file}\n"
         if with_auth
         else ""
+    )
+    process = (
+        ""
+        if rootless
+        else f"processManagement:\n  fork: true\n  pidFilePath: {_yaml_str(PID_FILE_PATH)}\n"
     )
     member = spec.member_configs.get(host)
     bind_ip = _with_loopback((member.bind_ip if member else None) or spec.bind_ip)
@@ -449,7 +542,7 @@ def _mongod_config(spec: BootstrapSpec, host: str, *, with_auth: bool) -> str:
         f"storage:\n  dbPath: {_yaml_str(spec.data_path)}\n"
         f"{security}"
         f"replication:\n  replSetName: {_yaml_str(spec.replica_set_name)}\n"
-        f"processManagement:\n  fork: true\n  pidFilePath: {_yaml_str(PID_FILE_PATH)}\n"
+        f"{process}"
         f"systemLog:\n  destination: file\n  path: {_yaml_str(spec.log_path)}\n  logAppend: true\n"
     )
 
@@ -615,17 +708,156 @@ def _require_run_id(spec: BootstrapSpec, step_name: str) -> str:
     return str(spec.run_id)
 
 
-def _owned_step(body: str, run_id: str, *, timeout_s: int = 30) -> StepAction:
+def _owned_body(body: str, run_id: str, marker: str) -> str:
+    """Guard a rollback body so it does nothing on a host this run never installed.
+
+    :param body: The rollback step's shell body.
+    :param run_id: The run the rollback belongs to.
+    :param marker: The ownership marker's path, already shell-quoted.
+    :return: ``body``, run only when ``marker`` holds ``run_id``.
+    """
+    guard = f'[ "$(cat {marker} 2>/dev/null)" = {shlex.quote(run_id)} ]'
+    return f"{guard} || exit 0\n{body}\n"
+
+
+def _owned_step(
+    body: str,
+    run_id: str,
+    *,
+    timeout_s: int = 30,
+    spec: BootstrapSpec | None = None,
+    rootless_body: str | None = None,
+) -> StepAction:
     """Build a rollback step that does nothing on a host this run never installed.
 
     :param body: The rollback step's shell body.
     :param run_id: The run the rollback belongs to.
     :param timeout_s: How long the step may run, in seconds.
+    :param spec: The host's bootstrap spec, which locates the rootless marker.
+        Required with ``rootless_body``.
+    :param rootless_body: The body on a host with the root step, guarded by the
+        instance's own marker instead.
     :return: A step running ``body`` only when :data:`OWNERSHIP_MARKER_PATH`
         holds ``run_id``.
     """
-    guard = f'[ "$(cat {OWNERSHIP_MARKER_PATH} 2>/dev/null)" = {shlex.quote(run_id)} ]'
-    return _shell_step(f"{guard} || exit 0\n{body}\n", timeout_s=timeout_s)
+    action = _shell_step(
+        _owned_body(body, run_id, OWNERSHIP_MARKER_PATH), timeout_s=timeout_s
+    )
+    if rootless_body is None or spec is None:
+        return action
+    marker = shlex.quote(_rootless_marker(spec))
+    return _with_rootless(action, _owned_body(rootless_body, run_id, marker))
+
+
+def _instance_dir(spec: BootstrapSpec) -> str:
+    """Return the instance's hand-over directory on a host with the root step.
+
+    :param spec: The host's bootstrap spec; its port names the instance.
+    :return: The directory's path.
+    """
+    return posixpath.join(HANDOVER_DIR, str(spec.port))
+
+
+def _rootless_marker(spec: BootstrapSpec) -> str:
+    """Return where a host with the root step keeps this instance's ownership marker.
+
+    :param spec: The host's bootstrap spec.
+    :return: The marker's path, inside the instance's hand-over directory.
+    """
+    return posixpath.join(_instance_dir(spec), "om-bootstrap")
+
+
+def _rootless_unit(spec: BootstrapSpec) -> str:
+    """Return the systemd unit that runs this instance on a host with the root step.
+
+    :param spec: The host's bootstrap spec; its port names the instance.
+    :return: The unit's name.
+    """
+    return f"pmm-mongod@{spec.port}.service"
+
+
+def _with_rootless(action: StepAction, body: str) -> StepAction:
+    """Add the body a host with the root step runs instead of ``action``'s.
+
+    :param action: The step as a root host runs it.
+    :param body: The shell body for a host with the root step.
+    :return: ``action`` with ``rootless_command`` set; its timeout covers both.
+    """
+    return action.model_copy(update={"rootless_command": ["sh", "-c", body]})
+
+
+def _rootless_config_body(spec: BootstrapSpec, host: str, *, with_auth: bool) -> str:
+    """Build the lines handing the instance's config to ``pmm-mongod@<port>``.
+
+    Writes ``mongod.conf``, readable by group ``mongod``, plus ``dirs``, the data
+    and log directories the unit creates as ``mongod`` before it starts, and
+    ``purge``, what the purge unit deletes on rollback. The config is written
+    beside its final name and moved over it, so the unit never copies half a file.
+
+    :param spec: The host's bootstrap spec.
+    :param host: The host being configured, which decides its ``bindIp``.
+    :param with_auth: Whether to include ``security.authorization``/``keyFile``.
+    :return: The shell lines.
+    """
+    config = _mongod_config(spec, host, with_auth=with_auth, rootless=True)
+    instance = _instance_dir(spec)
+    conf = shlex.quote(posixpath.join(instance, "mongod.conf"))
+    data_path = shlex.quote(spec.data_path)
+    log_dir = shlex.quote(posixpath.dirname(spec.log_path))
+    return "\n".join(
+        [
+            "umask 0027",
+            (
+                f"printf '%s\\n' {data_path} {log_dir}"
+                f" > {shlex.quote(posixpath.join(instance, 'dirs'))}"
+            ),
+            (
+                f"printf '%s\\n' {data_path} {shlex.quote(spec.log_path)}"
+                f" > {shlex.quote(posixpath.join(instance, 'purge'))}"
+            ),
+            f"cat > {conf}.new <<'MONGOD_CONF'\n{config}MONGOD_CONF",
+            f"mv -f {conf}.new {conf}",
+        ]
+    )
+
+
+#: What ``purge_package`` removes on a host with the root step: the packages its
+#: polkit rule lets the agent remove.
+_ROOTLESS_PACKAGES = (
+    "percona-server-mongodb",
+    "percona-server-mongodb-server",
+    "percona-server-mongodb-mongos",
+    "percona-server-mongodb-tools",
+    "percona-mongodb-mongosh",
+)
+
+
+#: Reads one key of :data:`ROOTLESS_RECORD_PATH`, the last line naming it.
+_RECORD_FUNCTION = (
+    f'om_record() {{ sed -n "s/^$1=//p" {ROOTLESS_RECORD_PATH} | tail -n 1; }}'
+)
+
+
+def _pkcon(arguments: str, step_name: str) -> str:
+    """Build the lines running one ``pkcon`` command, quiet unless it fails.
+
+    pkcon reports a refusal by polkit or a failed transaction on stdout, so on
+    failure the end of its output goes to stderr, where the step's detail reads it.
+
+    :param arguments: pkcon's arguments, already shell-quoted.
+    :param step_name: The step, named in the failure message.
+    :return: The shell lines.
+    """
+    return "\n".join(
+        [
+            "out=$(mktemp)",
+            "trap 'rm -f \"$out\"' EXIT",
+            f'if ! pkcon -p --noninteractive {arguments} >"$out" 2>&1; then',
+            f'  echo "{step_name}: pkcon {arguments} failed:" >&2',
+            '  tail -n 5 "$out" >&2; exit 1',
+            "fi",
+        ]
+    )
 
 
 class PackagesInstallStrategy:
@@ -694,7 +926,7 @@ class PackagesInstallStrategy:
 
     def _distribute_keyfile(
         self,
-        spec: BootstrapSpec,  # noqa: ARG002
+        spec: BootstrapSpec,
         params: dict[str, str] | None,
     ) -> StepAction:
         """Write the replica set's shared keyFile, owned by ``mongod`` and mode 400.
@@ -713,8 +945,8 @@ class PackagesInstallStrategy:
         appears in any process's argv. ``mongod`` ignores whitespace in a
         keyFile, so a trailing newline in the caller's content is harmless.
 
-        :param spec: The host's bootstrap spec. Unused — the keyFile's content is
-            entirely determined by ``params``, not by anything in ``spec``.
+        :param spec: The host's bootstrap spec. Only its port is read, which names
+            the instance's hand-over directory on a host with the root step.
         :param params: Must contain ``"key_file_content"``.
         :return: The step action.
         :raises ValueError: If ``params`` is missing ``"key_file_content"``.
@@ -722,10 +954,19 @@ class PackagesInstallStrategy:
         if not params or "key_file_content" not in params:
             raise ValueError("distribute_keyfile requires params['key_file_content']")
         encoded = base64.b64encode(params["key_file_content"].encode()).decode("ascii")
-        return _shell_step(
+        # Group mongod through the hand-over directory's setgid; the unit copies it
+        # to mode 400 as mongod.
+        key_file = shlex.quote(posixpath.join(_instance_dir(spec), "keyfile"))
+        rootless = (
+            "umask 0227\n"
+            f"printf '%s' {shlex.quote(encoded)} | base64 -d > {key_file}.new\n"
+            f"mv -f {key_file}.new {key_file}\n"
+        )
+        action = _shell_step(
             f"printf '%s' {shlex.quote(encoded)} | base64 -d | "
             f"install -m 400 -o mongod -g mongod /dev/stdin {KEY_FILE_PATH}"
         )
+        return _with_rootless(action, rootless)
 
     def _pre_check(self, spec: BootstrapSpec) -> StepAction:
         """Verify OS, paths, and disk space before touching anything.
@@ -775,25 +1016,84 @@ class PackagesInstallStrategy:
                     f'if [ -d {data_path} ] && [ -n "$(ls -A {data_path})" ]; then '
                     f'echo "pre_check: "{data_path}" is not empty" >&2; exit 1; fi'
                 ),
-                f"target={data_path}",
-                'while [ ! -d "$target" ]; do target="$(dirname "$target")"; done',
-                'avail=$(df --output=avail -B1 "$target" | tail -1)',
-                (
-                    "case \"$avail\" in ''|*[!0-9]*) "
-                    'echo "pre_check: could not measure free space at $target" >&2; '
-                    "exit 1;; esac"
-                ),
-                f"tenths=$((avail * 10 / {GIB}))",
-                (
-                    f'if [ "$avail" -lt {MIN_DATA_DISK_BYTES} ]; then '
-                    f'echo "pre_check: the data directory "{data_path}" needs at least '
-                    f"{MIN_DATA_DISK_BYTES // GIB} GiB free, but $target has "
-                    '$((tenths / 10)).$((tenths % 10)) GiB" >&2; exit 1; fi'
-                ),
+                _disk_space_check(spec),
                 _port_free_check(spec.port),
             ]
         )
-        return _shell_step(body)
+        return _with_rootless(_shell_step(body), self._rootless_pre_check(spec))
+
+    def _rootless_pre_check(self, spec: BootstrapSpec) -> str:
+        """Build ``pre_check`` for a host with the root step.
+
+        The agent cannot look inside ``mongod``'s directories there, so instead of
+        "no MongoDB and an empty data directory" it checks what the root step
+        recorded: that it prepared this port and the requested series, that the
+        data and log paths lie under directories it handed to ``mongod``, and that
+        no instance PMM installed here already runs on this port or uses this data
+        path. An installed package is expected: the root step itself refuses a host
+        with a MongoDB of its own.
+
+        :param spec: The host's bootstrap spec.
+        :return: The shell body.
+        """
+        channel = _psmdb_channel(spec.mongodb_version)
+        data_path = shlex.quote(spec.data_path)
+        log_dir = shlex.quote(posixpath.dirname(spec.log_path))
+        marker = shlex.quote(_rootless_marker(spec))
+        return "\n".join(
+            [
+                _RECORD_FUNCTION,
+                (
+                    'om_under() { p=$1; shift; for r in "$@"; do '
+                    'case "$p/" in "$r"/*) return 0;; esac; done; return 1; }'
+                ),
+                (
+                    'command -v pkcon >/dev/null 2>&1 || { echo "pre_check: pkcon '
+                    'not found; the root step installs PackageKit" >&2; exit 1; }'
+                ),
+                (
+                    f'case " $(om_record ports) " in *" {spec.port} "*) ;; *) '
+                    f'echo "pre_check: the root step did not prepare port {spec.port}'
+                    ' (it prepared: $(om_record ports))" >&2; exit 1;; esac'
+                ),
+                (
+                    f'case " $(om_record series) " in *" {channel} "*) ;; *) '
+                    f'echo "pre_check: the root step did not enable {channel}'
+                    ' (it enabled: $(om_record series))" >&2; exit 1;; esac'
+                ),
+                (
+                    f'if [ -e {marker} ]; then echo "pre_check: PMM already installed '
+                    f'an instance on port {spec.port} here" >&2; exit 1; fi'
+                ),
+                (
+                    f'case "/"{data_path}"/ /"{log_dir}"/" in */../*|*/./*) '
+                    'echo "pre_check: the data and log paths must not contain . or .."'
+                    " >&2; exit 1;; esac"
+                ),
+                (
+                    f"om_under {data_path} $(om_record data_roots) || {{ "
+                    f'echo "pre_check: the data path "{data_path}" is not under a '
+                    'directory the root step prepared ($(om_record data_roots))" >&2; '
+                    "exit 1; }"
+                ),
+                (
+                    f"om_under {log_dir} $(om_record log_roots) || {{ "
+                    f'echo "pre_check: the log directory "{log_dir}" is not under a '
+                    'directory the root step prepared ($(om_record log_roots))" >&2; '
+                    "exit 1; }"
+                ),
+                f"for used in {HANDOVER_DIR}/*/dirs; do",
+                f'  if [ -r "$used" ] && grep -qxF {data_path} "$used"; then',
+                (
+                    f'    echo "pre_check: the data path "{data_path}" belongs to the '
+                    'instance on port $(basename "$(dirname "$used")")" >&2; exit 1'
+                ),
+                "  fi",
+                "done",
+                _disk_space_check(spec),
+                _port_free_check(spec.port),
+            ]
+        )
 
     def _configure_repository(self, spec: BootstrapSpec) -> StepAction:
         """Install ``percona-release`` and enable the requested PSMDB channel.
@@ -818,7 +1118,10 @@ class PackagesInstallStrategy:
             )
         else:
             raise ValueError(f"unsupported OperatingSystem: {spec.os!r}")
-        return _shell_step(command, timeout_s=120)
+        # The root step enabled the series and pre_check confirmed it; the agent
+        # may only refresh the package lists.
+        rootless = _pkcon("refresh", "configure_repository")
+        return _with_rootless(_shell_step(command, timeout_s=120), rootless)
 
     def _install_package(self, spec: BootstrapSpec) -> StepAction:
         """Claim the host for this run, then install ``percona-server-mongodb``.
@@ -835,11 +1138,31 @@ class PackagesInstallStrategy:
         run_id = _require_run_id(spec, INSTALL_PACKAGE)
         pkg_manager = self._require_package_manager(spec.os)
         install = "apt-get install -y" if pkg_manager == "apt-get" else "dnf install -y"
-        return _shell_step(
+        installed = (
+            "dpkg-query -W -f '${Status}' percona-server-mongodb 2>/dev/null"
+            " | grep -q 'ok installed'"
+            if pkg_manager == "apt-get"
+            else "rpm -q percona-server-mongodb >/dev/null 2>&1"
+        )
+        instance = shlex.quote(_instance_dir(spec))
+        # The new directory inherits group mongod and setgid from the hand-over
+        # directory; a chmod by the agent, not in group mongod, would clear setgid.
+        rootless = "\n".join(
+            [
+                "umask 0027",
+                f"[ -d {instance} ] || mkdir {instance}",
+                f"printf '%s\\n' {shlex.quote(run_id)} > {shlex.quote(_rootless_marker(spec))}",
+                f"if ! {installed}; then",
+                _pkcon("install percona-server-mongodb", INSTALL_PACKAGE),
+                "fi",
+            ]
+        )
+        action = _shell_step(
             f"printf '%s\\n' {shlex.quote(run_id)} > {OWNERSHIP_MARKER_PATH}\n"
             f"{install} percona-server-mongodb",
             timeout_s=300,
         )
+        return _with_rootless(action, rootless)
 
     def _configure_mongod(self, spec: BootstrapSpec, host: str) -> StepAction:
         """Write ``mongod.conf`` enabling replication, with authorization left off.
@@ -929,7 +1252,9 @@ class PackagesInstallStrategy:
             f"install -d -m 750 -o mongod -g mongod {quoted_log_dir} ; }} && "
             f"cat > {CONFIG_PATH} <<'MONGOD_CONF'\n{config}MONGOD_CONF\n"
         )
-        return _shell_step(command)
+        return _with_rootless(
+            _shell_step(command), _rootless_config_body(spec, host, with_auth=False)
+        )
 
     def _start_service(self, spec: BootstrapSpec) -> StepAction:
         """Enable the ``mongod`` systemd unit and (re)start it on the config just written.
@@ -954,12 +1279,22 @@ class PackagesInstallStrategy:
         :param spec: The host's bootstrap spec; its log path is read.
         :return: The step action.
         """
-        return _shell_step(
+        action = _shell_step(
             f"{_mongod_diagnostics(spec)}\n"
             "systemctl enable mongod\n"
             f"{_run_or_explain('systemctl restart mongod')}\n",
             timeout_s=60,
         )
+        # polkit grants no "enable": the root step's boot unit starts every
+        # instance whose hand-over directory holds an "enabled" file.
+        enabled = shlex.quote(posixpath.join(_instance_dir(spec), "enabled"))
+        restart = f"systemctl restart {_rootless_unit(spec)}"
+        rootless = (
+            f"{_mongod_diagnostics(spec, rootless=True)}\n"
+            f"touch {enabled}\n"
+            f"{_run_or_explain(restart)}\n"
+        )
+        return _with_rootless(action, rootless)
 
     def _verify(self, spec: BootstrapSpec) -> StepAction:
         """Confirm ``mongod`` answers before declaring this host done.
@@ -975,10 +1310,14 @@ class PackagesInstallStrategy:
         :return: The step action.
         """
         wait = _wait_for_mongod_command(spec.port)
-        return _shell_step(
+        action = _shell_step(
             f"{_mongod_diagnostics(spec)}\n{_run_or_explain(wait)}\n",
             timeout_s=_wait_for_mongod_max_s() + 30,
         )
+        rootless = (
+            f"{_mongod_diagnostics(spec, rootless=True)}\n{_run_or_explain(wait)}\n"
+        )
+        return _with_rootless(action, rootless)
 
     def _require_package_manager(self, os_: OperatingSystem) -> str:
         """Map a supported OS to its package manager, or reject an unsupported one.
@@ -1224,9 +1563,16 @@ class PackagesInstallStrategy:
             f"cat > {CONFIG_PATH} <<'MONGOD_CONF' && systemctl restart mongod "
             f"&& {_wait_for_mongod_command(spec.port)}\n{config}MONGOD_CONF\n"
         )
-        return _shell_step(
+        action = _shell_step(
             command, timeout_s=MONGOD_RESTART_ALLOWANCE_S + _wait_for_mongod_max_s()
         )
+        # set -e stops the step at a failed write, before the restart.
+        rootless = (
+            f"{_rootless_config_body(spec, host, with_auth=True)}\n"
+            f"systemctl restart {_rootless_unit(spec)}\n"
+            f"{_wait_for_mongod_command(spec.port)}\n"
+        )
+        return _with_rootless(action, rootless)
 
     def plan_rollback_steps(self, spec: BootstrapSpec) -> list[str]:  # noqa: ARG002
         """Return this strategy's fixed per-host rollback step names.
@@ -1322,34 +1668,59 @@ class PackagesInstallStrategy:
                 return False
         return False
 
-    def _rollback_stop_service(self, spec: BootstrapSpec, run_id: str) -> StepAction:  # noqa: ARG002
+    def _rollback_stop_service(self, spec: BootstrapSpec, run_id: str) -> StepAction:
         """Stop and disable ``mongod``, tolerant of it never having started.
 
-        :param spec: The host's bootstrap spec. Unused.
+        :param spec: The host's bootstrap spec; its port names the instance on a
+            host with the root step.
         :param run_id: The run the rollback belongs to.
         :return: The step action.
         """
+        enabled = shlex.quote(posixpath.join(_instance_dir(spec), "enabled"))
         return _owned_step(
-            "systemctl disable --now mongod || true", run_id, timeout_s=60
+            "systemctl disable --now mongod || true",
+            run_id,
+            timeout_s=60,
+            spec=spec,
+            rootless_body=(
+                f"rm -f {enabled}\nsystemctl stop {_rootless_unit(spec)} || true"
+            ),
         )
 
-    def _rollback_remove_config(self, spec: BootstrapSpec, run_id: str) -> StepAction:  # noqa: ARG002
+    def _rollback_remove_config(self, spec: BootstrapSpec, run_id: str) -> StepAction:
         """Remove the config file ``configure_mongod`` wrote.
 
-        :param spec: The host's bootstrap spec. Unused.
+        On a host with the root step ``purge`` stays: ``remove_data`` needs it.
+
+        :param spec: The host's bootstrap spec; its port names the instance on a
+            host with the root step.
         :param run_id: The run the rollback belongs to.
         :return: The step action.
         """
-        return _owned_step(f"rm -f {CONFIG_PATH}", run_id)
+        instance = _instance_dir(spec)
+        files = " ".join(
+            shlex.quote(posixpath.join(instance, name))
+            for name in ("mongod.conf", "dirs")
+        )
+        return _owned_step(
+            f"rm -f {CONFIG_PATH}", run_id, spec=spec, rootless_body=f"rm -f {files}"
+        )
 
-    def _rollback_remove_keyfile(self, spec: BootstrapSpec, run_id: str) -> StepAction:  # noqa: ARG002
+    def _rollback_remove_keyfile(self, spec: BootstrapSpec, run_id: str) -> StepAction:
         """Remove the keyFile ``distribute_keyfile`` wrote.
 
-        :param spec: The host's bootstrap spec. Unused.
+        :param spec: The host's bootstrap spec; its port names the instance on a
+            host with the root step.
         :param run_id: The run the rollback belongs to.
         :return: The step action.
         """
-        return _owned_step(f"rm -f {KEY_FILE_PATH}", run_id)
+        key_file = shlex.quote(posixpath.join(_instance_dir(spec), "keyfile"))
+        return _owned_step(
+            f"rm -f {KEY_FILE_PATH}",
+            run_id,
+            spec=spec,
+            rootless_body=f"rm -f {key_file}",
+        )
 
     def _rollback_purge_package(self, spec: BootstrapSpec, run_id: str) -> StepAction:
         """Purge the ``percona-server-mongodb`` package ``install_package`` installed.
@@ -1387,14 +1758,72 @@ class PackagesInstallStrategy:
                 "dnf remove -y --setopt=clean_requirements_on_remove=True "
                 "percona-server-mongodb || true"
             )
-        return _owned_step(remove, run_id, timeout_s=120)
+        return _owned_step(
+            remove,
+            run_id,
+            timeout_s=300,
+            spec=spec,
+            rootless_body=self._rootless_purge_package(spec),
+        )
+
+    def _rootless_purge_package(self, spec: BootstrapSpec) -> str:
+        """Build ``purge_package`` for a host with the root step.
+
+        Removes every PSMDB package the root step lets the agent remove, through
+        PackageKit, unless another instance PMM installed on the host still needs
+        them. PackageKit leaves the dependencies it pulled in itself, such as
+        ``percona-telemetry-agent``, which the grant does not name. A refused or
+        failed removal does not fail the rollback, as on a root host.
+
+        :param spec: The host's bootstrap spec; its OS and port are read.
+        :return: The shell body.
+        """
+        packages = " ".join(_ROOTLESS_PACKAGES)
+        # Package ids, not names: PackageKit's apt backend lists an installed
+        # package once per Percona source and refuses to pick one.
+        if self._require_package_manager(spec.os) == "apt-get":
+            ids = (
+                "dpkg-query -W -f '${db:Status-Abbrev} ${Package};${Version};"
+                f"${{Architecture}};installed\\n' {packages} 2>/dev/null"
+                " | awk '$1 == \"ii\" { print $2 }' || true"
+            )
+        else:
+            ids = (
+                "rpm -q --qf '%{NAME};%{VERSION}-%{RELEASE};%{ARCH};installed\\n'"
+                f" {packages} 2>/dev/null | grep ';installed$' || true"
+            )
+        instance = shlex.quote(_instance_dir(spec) + "/")
+        return "\n".join(
+            [
+                f"for d in {HANDOVER_DIR}/*/; do",
+                f'  if [ "$d" != {instance} ] && [ -e "$d/om-bootstrap" ]; then',
+                "    echo 'purge_package: kept for the other instances here'; exit 0",
+                "  fi",
+                "done",
+                f"ids=$({ids})",
+                '[ -n "$ids" ] || exit 0',
+                "out=$(mktemp)",
+                "trap 'rm -f \"$out\"' EXIT",
+                'pkcon -p --noninteractive remove $ids >"$out" 2>&1 || tail -n 5 "$out"',
+            ]
+        )
 
     def _rollback_remove_data(self, spec: BootstrapSpec, run_id: str) -> StepAction:
         """Remove the data directory, then the ownership marker, as the last step.
 
-        :param spec: The host's bootstrap spec; only its data path is read.
+        On a host with the root step ``pmm-mongod-purge@<port>`` empties the data
+        directory and removes the log as ``mongod``, which is all it can touch;
+        removing the instance's hand-over directory then removes the marker.
+
+        :param spec: The host's bootstrap spec; only its data path and port are read.
         :param run_id: The run the rollback belongs to.
         :return: The step action.
         """
         body = f"rm -rf {shlex.quote(spec.data_path)}\nrm -f {OWNERSHIP_MARKER_PATH}"
-        return _owned_step(body, run_id, timeout_s=60)
+        rootless = (
+            f"systemctl start pmm-mongod-purge@{spec.port}.service\n"
+            f"rm -rf {shlex.quote(_instance_dir(spec))}"
+        )
+        return _owned_step(
+            body, run_id, timeout_s=60, spec=spec, rootless_body=rootless
+        )

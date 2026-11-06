@@ -13,18 +13,20 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see <https://www.gnu.org/licenses/>.
 
-"""Dispatch one bootstrap step's action to a host, as root, via Nomad.
+"""Dispatch one bootstrap step's action to a host, via Nomad.
 
 Rides the pre-seeded system ``exec-artifact`` task rather than ``run-python``
-(``om_inventory``'s own choice, ``om_inventory/dispatch.py``): ``run-python``'s
-job template has no ``sudo`` branch at all, so a step needing root (installing a
-package, writing ``/etc/mongod.conf``, managing a systemd unit — everything
-:class:`~app.extensions.apps.om_bootstrap.strategies.packages.PackagesInstallStrategy`
-does) would only work by accident, if the Nomad client agent itself happens to
-run as root. ``exec-artifact`` has an explicit sudo path: its job template
+(``om_inventory``'s own choice, ``om_inventory/dispatch.py``): its job template
 (``app/tasks/db/seed.py``) word-splits the ``interpreter`` meta and execs it
-against ``<task dir>/script``, so an interpreter of ``sudo bash`` invokes the
-script by its absolute path as ``sudo bash <path>``.
+against ``<task dir>/script``, so the script runs by its absolute path as
+``bash <path>``, as whoever the agent runs as.
+
+The script decides how it gets the privileges it needs, on the host, since only
+the host knows (see :func:`build_step_script`): a host carrying
+:data:`~app.extensions.apps.om_bootstrap.strategy.ROOTLESS_RECORD_PATH` runs the
+action's ``rootless_command`` as the agent's own user; any other host runs
+``command`` as root, re-executing itself as ``sudo -n bash <path>`` when the agent
+is not root, which is what an interpreter of ``sudo bash`` used to run.
 
 ``exec-artifact`` downloads its script as a Nomad artifact rather than a
 dispatch payload (unlike ``run-python``), which means the script has to exist as
@@ -72,25 +74,24 @@ from app.extensions.apps.framework.script_helpers import (
     build_artifact_download_url,
     post_task_execution,
 )
-from app.extensions.apps.om_bootstrap.strategy import StepAction
+from app.extensions.apps.om_bootstrap.strategy import ROOTLESS_RECORD_PATH, StepAction
 from app.extensions.snippets.models.snippet import SnippetExecutionMeta
 
 __all__ = [
     "ARTIFACT_TYPE",
     "EXEC_ARTIFACT_TASK",
-    "ROOT_INTERPRETER",
+    "STEP_INTERPRETER",
     "cleanup_run_scripts",
     "cleanup_step_script",
     "dispatch_step",
     "step_scripts_dir",
 ]
 
-#: The pre-seeded system task that runs an artifact-downloaded script as root.
+#: The pre-seeded system task that runs an artifact-downloaded script.
 EXEC_ARTIFACT_TASK = "exec-artifact"
-#: ``exec-artifact``'s job template keys its sudo branch on the interpreter meta
-#: literally starting with ``"sudo "`` (``app/tasks/db/seed.py``) — nothing else
-#: triggers it.
-ROOT_INTERPRETER = "sudo bash"
+#: Not ``sudo bash``: the script elevates itself where it needs to, see
+#: :func:`build_step_script`.
+STEP_INTERPRETER = "bash"
 #: The ``artifact_base_dirs`` discriminator ``om_bootstrap`` registers
 #: :func:`step_scripts_dir` under — see ``app.py``.
 ARTIFACT_TYPE = "om_bootstrap_step"
@@ -162,19 +163,27 @@ def build_step_script(action: StepAction) -> str:
     why it failed on stderr; see
     :mod:`~app.extensions.apps.om_bootstrap.reconcile`.
 
+    Before that, a script on a host without
+    :data:`~app.extensions.apps.om_bootstrap.strategy.ROOTLESS_RECORD_PATH` whose
+    agent is not root re-executes itself as ``sudo -n bash``, and a host with the
+    record runs ``action.rootless_command`` in place of ``action.command``.
+
     :param action: The step's action.
     :return: The script's full text, including the shebang.
     """
-    match action.command:
-        case ["sh", "-c", str(shell_body)]:
-            body = shell_body
-        case command:
-            body = shlex.join(command)
-    if not body.endswith("\n"):
-        body += "\n"
+    body = _script_body(action.command)
+    if action.rootless_command is not None:
+        body = (
+            f"if [ -e {ROOTLESS_RECORD_PATH} ]; then\n"
+            f"{_script_body(action.rootless_command)}"
+            f"else\n{body}fi\n"
+        )
     return (
         "#!/bin/sh\n"
         "set -eu\n"
+        f'if [ ! -e {ROOTLESS_RECORD_PATH} ] && [ "$(id -u)" != 0 ]; then\n'
+        '  exec sudo -n bash "$0"\n'
+        "fi\n"
         f'if [ -z "${{{TIMEOUT_GUARD_VAR}:-}}" ]; then\n'
         f"  export {TIMEOUT_GUARD_VAR}=1\n"
         f"  exec timeout --kill-after={TIMEOUT_KILL_AFTER_S} {action.timeout_s} "
@@ -182,6 +191,21 @@ def build_step_script(action: StepAction) -> str:
         "fi\n"
         f"{body}"
     )
+
+
+def _script_body(command: list[str]) -> str:
+    """Render one argv as script lines, ending in a newline.
+
+    :param command: An ``["sh", "-c", body]`` argv, rendered as ``body``, or any
+        other argv, rendered as one quoted line.
+    :return: The lines.
+    """
+    match command:
+        case ["sh", "-c", str(shell_body)]:
+            body = shell_body
+        case _:
+            body = shlex.join(command)
+    return body if body.endswith("\n") else body + "\n"
 
 
 def _write_private(path: Path, data: bytes) -> None:
@@ -269,7 +293,7 @@ async def dispatch_step(
     step_name: str,
     action: StepAction,
 ) -> int:
-    """Dispatch one step's action to ``host``, as root, and return its task history id.
+    """Dispatch one step's action to ``host`` and return its task history id.
 
     Does **not** wait for the run to finish — see the module docstring. A caller
     polls ``GET /api/tasks/history/{id}`` for progress, the same generic endpoint
@@ -307,7 +331,7 @@ async def _post_step_script(
     filename: str,
     digest: str,
 ) -> int:
-    """Ask the Tasks API to run an already-written step script on ``host``, as root.
+    """Ask the Tasks API to run an already-written step script on ``host``.
 
     :param tasks_api: The Tasks API client.
     :param request: See :func:`dispatch_step`.
@@ -323,7 +347,7 @@ async def _post_step_script(
     )
     meta = SnippetExecutionMeta(
         target=host,
-        interpreter=ROOT_INTERPRETER,
+        interpreter=STEP_INTERPRETER,
         snippet_source=snippet_source,
         snippet_filename=filename,
         md5_checksum=digest,

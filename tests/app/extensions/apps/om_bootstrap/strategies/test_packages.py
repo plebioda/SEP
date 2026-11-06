@@ -125,7 +125,8 @@ def _run_step(
     """Run a step the way a host does: as its dispatch script, under ``set -eu``.
 
     The script re-executes itself through ``timeout`` and ``sh``, so both are added
-    to ``bin_dir``.
+    to ``bin_dir``, and asks ``id`` whether it runs as root, which a stand-in
+    answers yes.
 
     :param action: The step's action.
     :param tmp_path: The test's scratch directory, where the script is written.
@@ -137,6 +138,10 @@ def _run_step(
             real = shutil.which(tool)
             assert real is not None
             (bin_dir / tool).symlink_to(real)
+    if not (bin_dir / "id").exists():
+        # A host runs these as root; anyone else would re-execute through sudo.
+        (bin_dir / "id").write_text("#!/bin/sh\necho 0\n")
+        (bin_dir / "id").chmod(0o755)
     script = tmp_path / "step.sh"
     script.write_text(build_step_script(action))
     return subprocess.run(
@@ -2115,3 +2120,62 @@ class TestBindIpReachesLoopback:
     ) -> None:
         """Leave the wildcards alone: beside 127.0.0.1, mongod breaks on either."""
         assert _with_loopback(bind_ip) == expected
+
+
+class TestRootlessCommands:
+    """Assert what a host with the root step runs in place of the root commands."""
+
+    @pytest.mark.parametrize("step_name", STEP_NAMES)
+    def test_every_host_step_has_a_rootless_command(self, step_name: str) -> None:
+        """Give every per-host step a body that needs neither root nor sudo."""
+        action = PackagesInstallStrategy().build_step(
+            step_name,
+            "node00",
+            _spec(OperatingSystem.ROCKY),
+            _STEP_PARAMS.get(step_name),
+        )
+
+        assert action.rootless_command is not None
+        body = _body(action.rootless_command)
+        assert "sudo" not in body
+        assert CONFIG_PATH not in body
+        assert "dnf " not in body
+
+    @pytest.mark.parametrize("step_name", RUN_STEP_NAMES)
+    def test_run_steps_need_no_rootless_command(self, step_name: str) -> None:
+        """Run the mongosh-only run-level steps unchanged on either kind of host."""
+        params = {"username": "u", "password": "p"}
+        action = PackagesInstallStrategy().build_run_step(
+            step_name, ["node00"], _spec(OperatingSystem.ROCKY), params
+        )
+
+        assert action.rootless_command is None
+
+    def test_rootless_config_runs_in_the_foreground_with_the_copied_keyfile(
+        self,
+    ) -> None:
+        """Leave out fork and the pid file, and name the keyFile the unit copies."""
+        action = PackagesInstallStrategy().build_finalize_step(
+            "enable_auth", "node00", _spec(OperatingSystem.UBUNTU)
+        )
+
+        assert action.rootless_command is not None
+        body = _body(action.rootless_command)
+        config = yaml.safe_load(
+            body.split("<<'MONGOD_CONF'\n")[1].split("MONGOD_CONF")[0]
+        )
+        assert "processManagement" not in config
+        assert config["security"]["keyFile"] == "/run/mongodb/pmm-27017/keyfile"
+        assert "systemctl restart pmm-mongod@27017.service" in body
+
+    def test_rootless_rollback_is_guarded_by_the_instance_marker(self) -> None:
+        """Touch nothing unless the instance's own marker names this run."""
+        action = PackagesInstallStrategy().build_rollback_step(
+            "remove_data", "node00", _spec(OperatingSystem.ROCKY)
+        )
+
+        assert action.rootless_command is not None
+        body = _body(action.rootless_command)
+        guard = f'[ "$(cat /var/lib/pmm-agent/mongod/27017/om-bootstrap 2>/dev/null)" = {RUN_ID} ] || exit 0'
+        assert body.startswith(guard)
+        assert "systemctl start pmm-mongod-purge@27017.service" in body
