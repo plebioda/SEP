@@ -296,6 +296,36 @@ class TestSetEnabled:
         assert [
             (run.status, run.error) for run in await ProbeRunManager.list(session)
         ] == [(ProbeRunStatus.FAILED, QUEUE_UNAVAILABLE_DETAIL)]
+    @pytest.mark.asyncio
+    async def test_switching_off_withdraws_the_sweep(
+        self, gated_api: AsyncClient
+    ) -> None:
+        """Withdraw the periodic sweep once PMM turns the switch back off.
+
+        Every other write sends ``true``, so this is the only case a handler
+        ignoring or inverting ``enabled`` would fail.
+
+        :param gated_api: The client passing the real gate.
+        """
+        schedules = om_inventory_app.periodic_task_schedules
+        assert schedules is not None
+        assert not isinstance(schedules, list)
+        await gated_api.put(
+            f"{BASE}/enabled",
+            json={"enabled": True},
+            headers={"Authorization": f"Bearer {INTERNAL_TOKEN}"},
+        )
+
+        response = await gated_api.put(
+            f"{BASE}/enabled",
+            json={"enabled": False},
+            headers={"Authorization": f"Bearer {INTERNAL_TOKEN}"},
+        )
+
+        assert response.status_code == status.HTTP_200_OK
+        assert response.json()["value"] is False
+        assert om_inventory_settings.ENABLED is False
+        assert schedules() == []
 
     @pytest.mark.asyncio
     async def test_a_body_without_the_switch_is_refused(
