@@ -296,6 +296,7 @@ class TestSetEnabled:
         assert [
             (run.status, run.error) for run in await ProbeRunManager.list(session)
         ] == [(ProbeRunStatus.FAILED, QUEUE_UNAVAILABLE_DETAIL)]
+
     @pytest.mark.asyncio
     async def test_switching_off_withdraws_the_sweep(
         self, gated_api: AsyncClient
