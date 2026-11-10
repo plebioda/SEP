@@ -17,7 +17,13 @@
 
 from __future__ import annotations
 
-__all__ = ["build_snapshot", "load_stored_overrides"]
+__all__ = [
+    "SubChainUpdates",
+    "build_snapshot",
+    "load_stored_overrides",
+    "load_stored_rows",
+    "merge_nested_overrides",
+]
 
 import logging
 from collections import defaultdict
@@ -32,6 +38,7 @@ from app.core.settings_override.manager import SettingsOverrideManager
 from app.core.settings_override.models import setting_class_token, SettingOverride
 from app.core.settings_override.registry import (
     clear_cached_properties,
+    coerce_field_value,
     coerce_nested_field_value,
     is_hot_reloadable,
     is_nested_overridable_parent,
@@ -136,10 +143,39 @@ async def load_stored_overrides(
     :return: A mapping of field name to coerced typed value.
     :raises sqlalchemy.exc.SQLAlchemyError: If the database query fails.
     """
+    whole, leaves = await load_stored_rows(session, settings_cls)
+    stored = dict(whole)
+    for parent, updates in leaves.items():
+        try:
+            stored[parent] = merge_nested_overrides(
+                settings_cls, parent, whole, updates, base_settings
+            )
+        except ValidationError as exc:
+            logger.warning(
+                "Nested override group for %s.%s failed to build a merged model: %s",
+                settings_cls.__name__,
+                parent,
+                exc,
+            )
+    return stored
+
+
+async def load_stored_rows(
+    session: AsyncSession,
+    settings_cls: type[BaseYamlSettings],
+) -> tuple[dict[str, Any], dict[str, SubChainUpdates]]:
+    """Return the stored overrides, coerced, before any leaf merges onto its parent.
+
+    :param session: The async SQLModel session used to query overrides.
+    :param settings_cls: The Pydantic settings class being read.
+    :return: The whole-field values by field name, and each nested parent's leaf
+        values by canonical parent name.
+    :raises sqlalchemy.exc.SQLAlchemyError: If the database query fails.
+    """
     rows = await SettingsOverrideManager.list(
         session, setting_class=setting_class_token(settings_cls), is_active=True
     )
-    stored: dict[str, Any] = {}
+    whole: dict[str, Any] = {}
     nested_groups = defaultdict(list)
     for row in rows:
         if "__" in row.key:
@@ -147,17 +183,15 @@ async def load_stored_overrides(
             # into a single group instead of clobbering each other.
             nested_groups[row.key.split("__", 1)[0].lower()].append(row)
             continue
-        _apply_top_level_row(stored, settings_cls, settings_cls.__name__, row)
+        _apply_top_level_row(whole, settings_cls, settings_cls.__name__, row)
+    leaves: dict[str, SubChainUpdates] = {}
     for prefix, group in nested_groups.items():
-        _apply_nested_group(
-            stored,
-            settings_cls,
-            settings_cls.__name__,
-            prefix,
-            group,
-            base_settings,
-        )
-    return stored
+        if resolved := _nested_group_updates(
+            settings_cls, settings_cls.__name__, prefix, group
+        ):
+            parent, updates = resolved
+            leaves[parent] = updates
+    return whole, leaves
 
 
 def _declared_default(settings_cls: type[BaseYamlSettings], name: str) -> Any:
@@ -225,23 +259,20 @@ def _apply_top_level_row(
         )
 
 
-def _apply_nested_group(
-    snapshot: dict[str, Any],
+def _nested_group_updates(
     settings_cls: type[BaseYamlSettings],
     setting_class: str,
     prefix: str,
     group: list[SettingOverride],
-    base_settings: BaseModel | None,
-) -> None:
-    """Merge every nested-override row sharing ``prefix`` into one parent copy.
+) -> tuple[str, SubChainUpdates] | None:
+    """Coerce every nested-override row sharing ``prefix`` into its parent's updates.
 
-    :param snapshot: The in-progress snapshot mapping, mutated in place.
     :param settings_cls: The Pydantic settings class being snapshotted.
     :param setting_class: The class identifier, for log messages.
     :param prefix: The shared top-level field name for this group.
     :param group: The nested rows whose key starts with ``prefix__``.
-    :param base_settings: The resolved settings instance seeding the parent
-        base value, or ``None`` to fall back to the field default.
+    :return: The canonical parent name and its coerced leaves, or ``None`` when
+        the group targets no usable parent or no row survives coercion.
     """
     resolved_parent = resolve_field_in_model(settings_cls, prefix)
     if resolved_parent is None:
@@ -250,7 +281,7 @@ def _apply_nested_group(
             setting_class,
             prefix,
         )
-        return
+        return None
     # Use the canonical field name so the snapshot key matches the proxy
     # attribute the reader looks up.
     canonical_prefix, field_info = resolved_parent
@@ -260,7 +291,7 @@ def _apply_nested_group(
             setting_class,
             canonical_prefix,
         )
-        return
+        return None
     parent_cls = annotation_pydantic_class(field_info.annotation)
     if parent_cls is None:
         logger.warning(
@@ -268,8 +299,8 @@ def _apply_nested_group(
             setting_class,
             canonical_prefix,
         )
-        return
-    sub_updates = {}
+        return None
+    sub_updates: SubChainUpdates = {}
     for row in group:
         try:
             raw = decrypt_secret_leaves(settings_cls, row.key, row.value)
@@ -303,21 +334,8 @@ def _apply_nested_group(
         # alongside the canonical one).
         sub_updates.setdefault(chain[1:], value)
     if not sub_updates:
-        return
-    parent_value = _parent_base_value(
-        snapshot, field_info, canonical_prefix, base_settings
-    )
-    try:
-        merged = _merge_into(parent_value, parent_cls, sub_updates)
-    except ValidationError as exc:
-        logger.warning(
-            "Nested override group for %s.%s failed to build a merged model: %s",
-            setting_class,
-            canonical_prefix,
-            exc,
-        )
-        return
-    snapshot[canonical_prefix] = merged
+        return None
+    return canonical_prefix, sub_updates
 
 
 def _parent_base_value(
@@ -355,6 +373,37 @@ def _parent_base_value(
     if isinstance(field_info.default, BaseModel):
         return field_info.default
     return None
+
+
+def merge_nested_overrides(
+    settings_cls: type[BaseYamlSettings],
+    parent: str,
+    whole: dict[str, Any],
+    sub_updates: SubChainUpdates,
+    base_settings: BaseModel | None,
+) -> Any:
+    """Return the value ``parent`` takes once ``sub_updates`` merge onto it.
+
+    Each leaf is coerced on its own, so a validator on the parent field, such as
+    a bound spanning two of its leaves, can only judge the merged result.
+
+    :param settings_cls: The Pydantic settings class declaring ``parent``.
+    :param parent: The canonical name of a nested-overridable model field.
+    :param whole: The whole-field overrides, whose model for ``parent`` is merged
+        onto in preference to ``base_settings``.
+    :param sub_updates: Mapping of canonical sub-chain to coerced value.
+    :param base_settings: The resolved settings instance, or ``None``.
+    :return: The merged parent, as the field's annotation validates it.
+    :raises ValidationError: If the merged parent cannot be built, or the field's
+        validators refuse it.
+    """
+    field_info = settings_cls.model_fields[parent]
+    parent_cls = annotation_pydantic_class(field_info.annotation)
+    if parent_cls is None:
+        raise TypeError(f"{settings_cls.__name__}.{parent} is not a model field")
+    parent_value = _parent_base_value(whole, field_info, parent, base_settings)
+    merged = _merge_into(parent_value, parent_cls, sub_updates)
+    return coerce_field_value(field_info, merged)
 
 
 def _merge_into(
@@ -411,9 +460,8 @@ def _build_nested_update(
         else:
             direct[head] = value
     for head, child_updates in deeper.items():
-        child_cls = annotation_pydantic_class(
-            type(parent).model_fields[head].annotation
-        )
+        child_field = type(parent).model_fields[head]
+        child_cls = annotation_pydantic_class(child_field.annotation)
         if child_cls is None:
             # Intermediate is not a Pydantic model -- the resolver should have
             # rejected this path, so treat it defensively as a no-op leaf set.
@@ -425,7 +473,9 @@ def _build_nested_update(
             if isinstance(direct.get(head), BaseModel)
             else getattr(parent, head, None)
         )
-        direct[head] = _merge_into(child, child_cls, child_updates)
+        direct[head] = coerce_field_value(
+            child_field, _merge_into(child, child_cls, child_updates)
+        )
     merged = parent.model_copy(update=direct)
     # ``model_copy`` is shallow and carries over already-evaluated
     # ``cached_property`` memos from ``parent``; drop them at every level so a
