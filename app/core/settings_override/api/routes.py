@@ -24,6 +24,7 @@ __all__ = [
     "collect_class_setting_responses",
 ]
 
+from collections import defaultdict
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
@@ -31,7 +32,7 @@ from functools import partial
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, params, Request, status
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from pydantic.fields import FieldInfo
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import col
@@ -55,7 +56,10 @@ from app.core.settings_override.api.models import (
 )
 from app.core.settings_override.cache import (
     load_stored_overrides,
+    load_stored_rows,
+    merge_nested_overrides,
     stored_overrides_from_rows,
+    SubChainUpdates,
 )
 from app.core.settings_override.constants import NESTED_VALUE_MISSING
 from app.core.settings_override.lifecycle import (
@@ -102,6 +106,7 @@ from app.core.utils.cross_field import (
 )
 from app.core.utils.date_time import utc_now
 from app.core.utils.exceptions import exception_detail
+from app.core.utils.pydantic import annotation_pydantic_class
 
 ClassEntry = tuple[str, type[BaseYamlSettings], OverridableSettingsProxy]
 
@@ -561,8 +566,9 @@ async def _validate_patch_body(
     materialized value is not JSON-storable); plain fields persist the coerced
     value.
 
-    Once every key passes on its own, the batch's end state is judged against
-    the class's ``CROSS_FIELD_RULES`` (see :func:`_cross_field_errors`), so a
+    Once every key passes on its own, the batch's end state is judged: each
+    nested parent it touches against its field (see :func:`_nested_parent_errors`),
+    then the class's ``CROSS_FIELD_RULES`` (see :func:`_cross_field_errors`), so a
     batch moving several related fields at once is accepted whatever its key
     order.
 
@@ -643,12 +649,117 @@ async def _validate_patch_body(
         materialized_by_key[key] = materialized
 
     if not errors:
+        errors = await _nested_parent_errors(
+            session,
+            settings_cls,
+            proxy,
+            setting=materialized_by_key,
+            nested=[(key, value) for key, value in to_apply if "__" in key],
+        )
+    if not errors:
         errors = await _cross_field_errors(
             session, settings_cls, proxy, setting=materialized_by_key
         )
     if errors:
         raise HTTPUnprocessableEntityException(detail=errors)
     return to_apply
+
+
+async def _nested_parent_errors(
+    session: AsyncSession,
+    settings_cls: type[BaseYamlSettings],
+    proxy: OverridableSettingsProxy,
+    *,
+    setting: Mapping[str, Any] | None = None,
+    nested: list[tuple[str, Any]] | None = None,
+    clearing: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return one 422 entry per changed key whose parent the next snapshot would drop.
+
+    Each parent is merged from the rows the change leaves, as the snapshot merges
+    them. Like :func:`_cross_field_errors`, a change is refused when that drops a
+    leaf it writes, or leaves honoured today; leaves already ignored never block it.
+    It takes no lock either, so the snapshot ignores what two racing changes leave.
+
+    :param session: The sub-app's database session, read for stored overrides.
+    :param settings_cls: The Pydantic settings class being changed.
+    :param proxy: The proxy wrapping it, for the YAML/env base values.
+    :param setting: The materialized top-level values a PATCH would store.
+    :param nested: The coerced nested writes a PATCH would store, keyed by
+        canonical path.
+    :param clearing: The key a DELETE would revert to its YAML/env value.
+    :return: Pydantic-style entries, one per refusal of each changed key.
+    """
+    setting = setting or {}
+    written: defaultdict[str, SubChainUpdates] = defaultdict(dict)
+    changed: defaultdict[str, list[str]] = defaultdict(list)
+    for key, value in nested or ():
+        parent, *chain = key.split("__")
+        written[parent][tuple(chain)] = value
+        changed[parent].append(key)
+    for key in [*setting, *([clearing] if clearing else [])]:
+        changed[key.split("__")[0]].append(key)
+    touched = {
+        parent: keys
+        for parent, keys in changed.items()
+        if is_nested_overridable_parent(settings_cls, parent)
+        and annotation_pydantic_class(settings_cls.model_fields[parent].annotation)
+    }
+    if not touched:
+        return []
+    base = proxy.get_base()
+    whole, leaves = await load_stored_rows(session, settings_cls)
+    after_whole = {key: value for key, value in whole.items() if key != clearing}
+    after_whole |= setting
+    errors: list[dict[str, Any]] = []
+    for parent, keys in touched.items():
+        stored = leaves.get(parent, {})
+        after = {
+            chain: value
+            for chain, value in stored.items()
+            if "__".join((parent, *chain)) != clearing
+        } | written.get(parent, {})
+        if not after:
+            continue
+        try:
+            merge_nested_overrides(settings_cls, parent, after_whole, after, base)
+        except ValidationError as exc:
+            if parent in written or _merges(settings_cls, parent, whole, stored, base):
+                errors.extend(
+                    {
+                        "loc": ["body", key, *entry.get("loc", ())],
+                        "msg": entry.get("msg", ""),
+                        "type": entry.get("type", "value_error"),
+                    }
+                    for key in keys
+                    for entry in exc.errors()
+                )
+    return errors
+
+
+def _merges(
+    settings_cls: type[BaseYamlSettings],
+    parent: str,
+    whole: dict[str, Any],
+    sub_updates: SubChainUpdates,
+    base: BaseModel,
+) -> bool:
+    """Return whether ``sub_updates`` merge onto ``parent`` as the snapshot needs.
+
+    :param settings_cls: The Pydantic settings class declaring ``parent``.
+    :param parent: The canonical name of a nested-overridable model field.
+    :param whole: The whole-field overrides the leaves merge onto.
+    :param sub_updates: The leaves, by canonical sub-chain.
+    :param base: The YAML/env settings instance.
+    :return: ``True`` when there are leaves and the merged parent validates.
+    """
+    if not sub_updates:
+        return False
+    try:
+        merge_nested_overrides(settings_cls, parent, whole, sub_updates, base)
+    except ValidationError:
+        return False
+    return True
 
 
 def _validate_nested_key(
@@ -1713,7 +1824,8 @@ async def _clear_class_override(
     :raises HTTPNotFoundException: If ``key`` is not a field on the class.
     :raises HTTPConflictException: If the field is NOT_OVERRIDABLE and has no row.
     :raises HTTPUnprocessableEntityException: If ``key`` names a NESTED_ONLY
-        parent, or reverting it would break a cross-field rule.
+        parent, or reverting it would leave its parent invalid or break a
+        cross-field rule.
     """
     key = canonical_override_key(settings_cls, key)
     field_meta = _field_meta_or_404(settings_cls, key)
@@ -1725,7 +1837,10 @@ async def _clear_class_override(
         key=key,
     )
     _assert_key_deletable(settings_cls, field_meta, has_override_row=bool(rows))
-    if errors := await _cross_field_errors(session, settings_cls, proxy, clearing=key):
+    errors = await _nested_parent_errors(
+        session, settings_cls, proxy, clearing=key
+    ) or await _cross_field_errors(session, settings_cls, proxy, clearing=key)
+    if errors:
         raise HTTPUnprocessableEntityException(detail=errors)
     await _delete_override_rows(session, token, rows)
     previous = proxy.get_snapshot()
