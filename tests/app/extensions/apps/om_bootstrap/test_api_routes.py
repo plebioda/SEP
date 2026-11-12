@@ -412,6 +412,37 @@ class TestTriggerRunValidation:
         assert response.status_code == status.HTTP_201_CREATED
 
     @pytest.mark.parametrize(
+        ("os_", "version", "detail"),
+        [
+            (
+                "ubuntu",
+                "9.0",
+                "MongoDB 9.0 is not supported on Ubuntu; supported: 7.0, 8.0",
+            ),
+            (
+                "rocky",
+                "6.0.20",
+                "MongoDB 6.0.20 is not supported on Rocky Linux; supported: 7.0, 8.0",
+            ),
+        ],
+    )
+    def test_rejects_a_version_no_release_is_supported_for(
+        self,
+        regular_user: CasdoorUser,
+        session: AsyncSession,
+        os_: str,
+        version: str,
+        detail: str,
+    ) -> None:
+        """Refuse a version outside the supported table, before planning anything."""
+        response = api_client(regular_user, session).post(
+            f"{BASE}/runs", json=self._payload(os=os_, mongodb_version=version)
+        )
+
+        assert response.status_code == status.HTTP_400_BAD_REQUEST
+        assert response.json()["detail"] == detail
+
+    @pytest.mark.parametrize(
         "config", [{"priority": 0, "votes": False}, {"priority": 0, "votes": True}]
     )
     def test_rejects_member_configs_with_no_electable_member(
@@ -427,6 +458,40 @@ class TestTriggerRunValidation:
         )
 
         assert response.status_code == status.HTTP_400_BAD_REQUEST
+
+
+class TestListSupportedReleases:
+    """Assert GET /supported-releases serves the table PMM reads."""
+
+    def test_serves_every_distribution_with_its_releases(
+        self, regular_user: CasdoorUser
+    ) -> None:
+        """Serve each release's versions and how a node's VERSION_ID is matched."""
+        response = api_client(regular_user).get(f"{BASE}/supported-releases")
+
+        assert response.status_code == status.HTTP_200_OK
+        both = ["7.0", "8.0"]
+        assert response.json() == [
+            {
+                "os": "ubuntu",
+                "name": "Ubuntu",
+                "release_match": "exact",
+                "releases": [
+                    {"version": "22.04", "mongodb_versions": both},
+                    {"version": "24.04", "mongodb_versions": both},
+                ],
+            },
+            {
+                "os": "rocky",
+                "name": "Rocky Linux",
+                "release_match": "major",
+                "releases": [
+                    {"version": "8", "mongodb_versions": both},
+                    {"version": "9", "mongodb_versions": both},
+                    {"version": "10", "mongodb_versions": ["8.0"]},
+                ],
+            },
+        ]
 
 
 class TestListBootstrapRuns:
