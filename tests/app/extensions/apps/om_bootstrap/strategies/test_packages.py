@@ -2168,6 +2168,32 @@ class TestRootlessCommands:
         assert config["security"]["keyFile"] == "/run/mongodb/pmm-27017/keyfile"
         assert "systemctl restart pmm-mongod@27017.service" in body
 
+    @pytest.mark.parametrize(
+        ("kind", "step_name", "action"),
+        [
+            ("step", "pre_check", "check"),
+            ("step", "configure_mongod", "open"),
+            ("rollback", "remove_config", "close"),
+        ],
+    )
+    def test_rootless_steps_hand_the_port_to_the_root_step_helper(
+        self, kind: str, step_name: str, action: str
+    ) -> None:
+        """Check, open and close the port through the helper the root step installs."""
+        strategy = PackagesInstallStrategy()
+        spec = _spec(OperatingSystem.ROCKY)
+        built = (
+            strategy.build_step(step_name, "node00", spec, _STEP_PARAMS.get(step_name))
+            if kind == "step"
+            else strategy.build_rollback_step(step_name, "node00", spec)
+        )
+
+        assert built.rootless_command is not None
+        body = _body(built.rootless_command)
+        assert "om_record port_range" in body
+        assert f"systemctl start pmm-operations-port@{action}-27017.service" in body
+        assert "/run/pmm-operations/port-27017" in body
+
     def test_rootless_rollback_is_guarded_by_the_instance_marker(self) -> None:
         """Touch nothing unless the instance's own marker names this run."""
         action = PackagesInstallStrategy().build_rollback_step(

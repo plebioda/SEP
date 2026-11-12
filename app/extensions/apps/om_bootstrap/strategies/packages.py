@@ -219,6 +219,10 @@ ROOTLESS_KEY_FILE_PATH = "/run/mongodb/pmm-{port}/keyfile"
 #: stops on a failure, readable by the agent.
 ROOTLESS_LAST_ERROR_PATH = "/run/mongodb/pmm-{port}/last-error"
 
+#: Where ``pmm-operations-port@<action>-<port>``, the root step's port helper,
+#: leaves its last answer for a port, readable by the agent.
+PORT_RESULT_PATH = "/run/pmm-operations/port-{port}"
+
 
 def _psmdb_channel(mongodb_version: str) -> str:
     """Turn ``"8.0"`` (or ``"8.0.4"``) into the channel name ``"psmdb-80"``.
@@ -838,6 +842,35 @@ _RECORD_FUNCTION = (
 )
 
 
+def _port_helper(action: str, spec: BootstrapSpec, step_name: str) -> str:
+    """Build the lines asking the root step's port helper to check, open or close a port.
+
+    ``pmm-operations-port@<action>-<port>`` runs as root, and polkit lets the agent
+    start it. It checks the port against the range the root step allows, then
+    opens it in firewalld and labels it for SELinux, or undoes only what it did
+    itself. Its answer goes to :data:`PORT_RESULT_PATH`, since the agent cannot
+    read the journal. ``close`` never fails the step.
+
+    :param action: ``check``, ``open`` or ``close``.
+    :param spec: The host's bootstrap spec; its port is the one acted on.
+    :param step_name: The step, named in the failure message.
+    :return: The shell lines.
+    """
+    unit = f"pmm-operations-port@{action}-{spec.port}.service"
+    result = PORT_RESULT_PATH.format(port=spec.port)
+    answer = f"$(cat {result} 2>/dev/null || echo '{unit} failed')"
+    if action == "close":
+        return f'systemctl start {unit} 2>/dev/null || echo "{step_name}: {answer}"'
+    return "\n".join(
+        [
+            f"if ! systemctl start {unit} 2>/dev/null; then",
+            f'  echo "{step_name}: {answer}" >&2; exit 1',
+            "fi",
+            f"cat {result} 2>/dev/null || true",
+        ]
+    )
+
+
 def _pkcon(arguments: str, step_name: str) -> str:
     """Build the lines running one ``pkcon`` command, quiet unless it fails.
 
@@ -1027,10 +1060,11 @@ class PackagesInstallStrategy:
 
         The agent cannot look inside ``mongod``'s directories there, so instead of
         "no MongoDB and an empty data directory" it checks what the root step
-        recorded: that it prepared this port and the requested series, that the
-        data and log paths lie under directories it handed to ``mongod``, and that
-        no instance PMM installed here already runs on this port or uses this data
-        path. An installed package is expected: the root step itself refuses a host
+        recorded: that the port lies in the range it allows, which its port helper
+        then checks as root (or, from a root step without one, that it prepared
+        this port), that it enabled the requested series, that the data and log
+        paths lie under directories it handed to ``mongod``, and that no instance
+        PMM installed here already runs on this port or uses this data path. An installed package is expected: the root step itself refuses a host
         with a MongoDB of its own.
 
         :param spec: The host's bootstrap spec.
@@ -1051,11 +1085,24 @@ class PackagesInstallStrategy:
                     'command -v pkcon >/dev/null 2>&1 || { echo "pre_check: pkcon '
                     'not found; the root step installs PackageKit" >&2; exit 1; }'
                 ),
+                # A root step without the port helper prepared fixed ports only.
+                'range=$(om_record port_range)\nif [ -z "$range" ]; then',
                 (
-                    f'case " $(om_record ports) " in *" {spec.port} "*) ;; *) '
+                    f'  case " $(om_record ports) " in *" {spec.port} "*) ;; *) '
                     f'echo "pre_check: the root step did not prepare port {spec.port}'
                     ' (it prepared: $(om_record ports))" >&2; exit 1;; esac'
                 ),
+                (
+                    f'elif [ {spec.port} -lt "${{range%-*}}" ] || '
+                    f'[ {spec.port} -gt "${{range#*-}}" ]; then'
+                ),
+                (
+                    f'  echo "pre_check: port {spec.port} is outside the range the '
+                    'root step allows ($range)" >&2; exit 1'
+                ),
+                "else",
+                _port_helper("check", spec, PRE_CHECK),
+                "fi",
                 (
                     f'case " $(om_record series) " in *" {channel} "*) ;; *) '
                     f'echo "pre_check: the root step did not enable {channel}'
@@ -1252,9 +1299,17 @@ class PackagesInstallStrategy:
             f"install -d -m 750 -o mongod -g mongod {quoted_log_dir} ; }} && "
             f"cat > {CONFIG_PATH} <<'MONGOD_CONF'\n{config}MONGOD_CONF\n"
         )
-        return _with_rootless(
-            _shell_step(command), _rootless_config_body(spec, host, with_auth=False)
+        rootless = "\n".join(
+            [
+                _rootless_config_body(spec, host, with_auth=False),
+                _RECORD_FUNCTION,
+                'if [ -n "$(om_record port_range)" ]; then',
+                _port_helper("open", spec, "configure_mongod"),
+                "fi",
+            ]
         )
+        # semanage takes about 15s to label a port on RHEL 8.
+        return _with_rootless(_shell_step(command, timeout_s=120), rootless)
 
     def _start_service(self, spec: BootstrapSpec) -> StepAction:
         """Enable the ``mongod`` systemd unit and (re)start it on the config just written.
@@ -1691,6 +1746,7 @@ class PackagesInstallStrategy:
         """Remove the config file ``configure_mongod`` wrote.
 
         On a host with the root step ``purge`` stays: ``remove_data`` needs it.
+        The port helper there closes what ``configure_mongod`` opened.
 
         :param spec: The host's bootstrap spec; its port names the instance on a
             host with the root step.
@@ -1702,8 +1758,21 @@ class PackagesInstallStrategy:
             shlex.quote(posixpath.join(instance, name))
             for name in ("mongod.conf", "dirs")
         )
+        rootless = "\n".join(
+            [
+                f"rm -f {files}",
+                _RECORD_FUNCTION,
+                'if [ -n "$(om_record port_range)" ]; then',
+                _port_helper("close", spec, "remove_config"),
+                "fi",
+            ]
+        )
         return _owned_step(
-            f"rm -f {CONFIG_PATH}", run_id, spec=spec, rootless_body=f"rm -f {files}"
+            f"rm -f {CONFIG_PATH}",
+            run_id,
+            timeout_s=60,
+            spec=spec,
+            rootless_body=rootless,
         )
 
     def _rollback_remove_keyfile(self, spec: BootstrapSpec, run_id: str) -> StepAction:
