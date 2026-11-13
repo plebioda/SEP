@@ -74,6 +74,11 @@ from app.extensions.apps.framework.script_helpers import (
     build_artifact_download_url,
     post_task_execution,
 )
+from app.extensions.apps.om_bootstrap.grants import (
+    GRANT_ENV_VAR,
+    GRANT_SLACK_S,
+    sign_grant,
+)
 from app.extensions.apps.om_bootstrap.strategy import ROOTLESS_RECORD_PATH, StepAction
 from app.extensions.snippets.models.snippet import SnippetExecutionMeta
 
@@ -140,7 +145,7 @@ def step_script_filename(run_id: str, host: str, step_name: str) -> str:
     return f"{run_id}_{host}_{step_name}.sh"
 
 
-def build_step_script(action: StepAction) -> str:
+def build_step_script(action: StepAction, grant: str | None = None) -> str:
     """Render a step's action as a standalone POSIX shell script.
 
     An ``["sh", "-c", body]`` action is written with ``body`` as the script's
@@ -166,16 +171,20 @@ def build_step_script(action: StepAction) -> str:
     Before that, a script on a host without
     :data:`~app.extensions.apps.om_bootstrap.strategy.ROOTLESS_RECORD_PATH` whose
     agent is not root re-executes itself as ``sudo -n bash``, and a host with the
-    record runs ``action.rootless_command`` in place of ``action.command``.
+    record runs ``action.rootless_command`` in place of ``action.command``, with
+    ``grant`` in :data:`~app.extensions.apps.om_bootstrap.grants.GRANT_ENV_VAR`
+    for the root step's socket helper.
 
     :param action: The step's action.
+    :param grant: The signed grant for ``action.operations``, if any.
     :return: The script's full text, including the shebang.
     """
     body = _script_body(action.command)
     if action.rootless_command is not None:
+        export = f"export {GRANT_ENV_VAR}={shlex.quote(grant)}\n" if grant else ""
         body = (
             f"if [ -e {ROOTLESS_RECORD_PATH} ]; then\n"
-            f"{_script_body(action.rootless_command)}"
+            f"{export}{_script_body(action.rootless_command)}"
             f"else\n{body}fi\n"
         )
     return (
@@ -240,6 +249,10 @@ async def write_step_script(
     disk write here would stall every other request that worker is serving for
     its duration.
 
+    The step's grant is signed here, at dispatch, so it expires
+    :data:`~app.extensions.apps.om_bootstrap.grants.GRANT_SLACK_S` after the
+    step's own timeout would.
+
     :param run_id: The bootstrap run this step belongs to.
     :param host: The node name being bootstrapped.
     :param step_name: The step's name.
@@ -248,7 +261,14 @@ async def write_step_script(
         :class:`~app.extensions.snippets.models.snippet.SnippetExecutionMeta` requires
         the digest to verify the download on the executor side.
     """
-    data = build_step_script(action).encode("utf-8")
+    grant = sign_grant(
+        node=host,
+        run_id=run_id,
+        step=step_name,
+        operations=action.operations,
+        ttl_s=action.timeout_s + GRANT_SLACK_S,
+    )
+    data = build_step_script(action, grant).encode("utf-8")
     path = step_scripts_dir() / step_script_filename(run_id, host, step_name)
     await asyncio.to_thread(_write_private, path, data)
     digest = hashlib.md5(data, usedforsecurity=False).hexdigest()

@@ -147,6 +147,46 @@ class TestBuildStepScript:
         )
         assert result.stdout == "as root\n"
 
+    def test_exports_the_grant_on_the_rootless_branch_only(self) -> None:
+        """Hand the socket helper's client the grant, never to the root branch."""
+        action = StepAction(
+            command=["echo", "as root"], rootless_command=["echo", "rootless"]
+        )
+
+        script = dispatch.build_step_script(action, "cGF5bG9hZA==.c2ln")
+
+        rootless, root = script.split("else\n")
+        assert (
+            "export PMM_OPERATIONS_GRANT=cGF5bG9hZA==.c2ln\necho rootless\n" in rootless
+        )
+        assert "PMM_OPERATIONS_GRANT" not in root
+
+    @pytest.mark.asyncio
+    async def test_signs_the_steps_operations_for_its_host_and_run(self) -> None:
+        """Bind the grant to the node, run and step being dispatched."""
+        action = StepAction(
+            command=["true"],
+            rootless_command=["true"],
+            operations=["restart 27017"],
+            timeout_s=60,
+        )
+        with patch.object(dispatch, "sign_grant", return_value="p.s") as sign:
+            path, _ = await dispatch.write_step_script(
+                "run-grant", "node00", "start_service", action
+            )
+        try:
+            assert "export PMM_OPERATIONS_GRANT=p.s" in path.read_text()
+        finally:
+            dispatch.cleanup_step_script("run-grant", "node00", "start_service")
+
+        sign.assert_called_once_with(
+            node="node00",
+            run_id="run-grant",
+            step="start_service",
+            operations=["restart 27017"],
+            ttl_s=60 + dispatch.GRANT_SLACK_S,
+        )
+
     def test_quotes_arguments_containing_spaces(self) -> None:
         """Keep an argument with a space as one argument, not two."""
         script = dispatch.build_step_script(StepAction(command=["echo", "two words"]))

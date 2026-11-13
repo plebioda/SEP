@@ -33,6 +33,7 @@ from app.extensions.apps.om_bootstrap.dispatch import build_step_script
 from app.extensions.apps.om_bootstrap.strategies import packages
 from app.extensions.apps.om_bootstrap.strategies.packages import (
     _mongosh_eval_command,
+    _OPERATIONS_FUNCTIONS,
     _with_loopback,
     CONFIG_PATH,
     KEY_FILE_PATH,
@@ -47,6 +48,7 @@ from app.extensions.apps.om_bootstrap.strategy import (
     InstallStrategy,
     MemberConfig,
     OperatingSystem,
+    ROOTLESS_RECORD_PATH,
     StepAction,
     StepRecord,
     StepStatus,
@@ -2166,7 +2168,8 @@ class TestRootlessCommands:
         )
         assert "processManagement" not in config
         assert config["security"]["keyFile"] == "/run/mongodb/pmm-27017/keyfile"
-        assert "systemctl restart pmm-mongod@27017.service" in body
+        assert "om_unit restart 27017" in body
+        assert action.operations == ["restart 27017"]
 
     @pytest.mark.parametrize(
         ("kind", "step_name", "action"),
@@ -2191,8 +2194,8 @@ class TestRootlessCommands:
         assert built.rootless_command is not None
         body = _body(built.rootless_command)
         assert "om_record port_range" in body
-        assert f"systemctl start pmm-operations-port@{action}-27017.service" in body
-        assert "/run/pmm-operations/port-27017" in body
+        assert f"om_port {action} 27017" in body
+        assert built.operations == [f"port {action} 27017"]
 
     def test_rootless_rollback_is_guarded_by_the_instance_marker(self) -> None:
         """Touch nothing unless the instance's own marker names this run."""
@@ -2203,5 +2206,100 @@ class TestRootlessCommands:
         assert action.rootless_command is not None
         body = _body(action.rootless_command)
         guard = f'[ "$(cat /var/lib/pmm-agent/mongod/27017/om-bootstrap 2>/dev/null)" = {RUN_ID} ] || exit 0'
-        assert body.startswith(guard)
-        assert "systemctl start pmm-mongod-purge@27017.service" in body
+        assert body.removeprefix(f"{_OPERATIONS_FUNCTIONS}\n").startswith(guard)
+        assert "om_purge 27017" in body
+
+    @pytest.mark.parametrize(
+        ("kind", "step_name", "operations"),
+        [
+            ("step", "pre_check", ["port check 27017"]),
+            ("step", "configure_repository", ["refresh"]),
+            ("step", "install_package", ["install percona-server-mongodb"]),
+            ("step", "distribute_keyfile", []),
+            ("step", "configure_mongod", ["port open 27017"]),
+            ("step", "start_service", ["restart 27017"]),
+            ("step", "verify", []),
+            ("rollback", "stop_service", ["stop 27017"]),
+            ("rollback", "remove_config", ["port close 27017"]),
+            ("rollback", "remove_keyfile", []),
+            (
+                "rollback",
+                "purge_package",
+                ["remove " + " ".join(packages._ROOTLESS_PACKAGES)],
+            ),
+            ("rollback", "remove_data", ["purge 27017"]),
+        ],
+    )
+    def test_each_step_names_the_requests_its_grant_allows(
+        self, kind: str, step_name: str, operations: list[str]
+    ) -> None:
+        """Declare exactly what the body asks the root step for, and start with the functions."""
+        strategy = PackagesInstallStrategy()
+        spec = _spec(OperatingSystem.ROCKY)
+        built = (
+            strategy.build_step(step_name, "node00", spec, _STEP_PARAMS.get(step_name))
+            if kind == "step"
+            else strategy.build_rollback_step(step_name, "node00", spec)
+        )
+
+        assert built.operations == operations
+        assert built.rootless_command is not None
+        assert _body(built.rootless_command).startswith(_OPERATIONS_FUNCTIONS)
+
+    @pytest.mark.parametrize(
+        ("frontend", "call", "expected"),
+        [
+            ("socket", "om_unit restart 27017", "pmm-operations restart 27017"),
+            (
+                "polkit",
+                "om_unit restart 27017",
+                "systemctl restart pmm-mongod@27017.service",
+            ),
+            ("socket", "om_purge 27017", "pmm-operations purge 27017"),
+            (
+                "polkit",
+                "om_purge 27017",
+                "systemctl start pmm-mongod-purge@27017.service",
+            ),
+            ("socket", "om_port open 27017", "pmm-operations port open 27017"),
+            (
+                "polkit",
+                "om_port open 27017",
+                "systemctl start pmm-operations-port@open-27017.service",
+            ),
+            (
+                "socket",
+                "om_packages install percona-server-mongodb",
+                "pmm-operations install percona-server-mongodb",
+            ),
+            (
+                "polkit",
+                "om_packages install percona-server-mongodb",
+                "pkcon -p --noninteractive install percona-server-mongodb",
+            ),
+        ],
+    )
+    def test_requests_go_through_the_front_end_the_record_names(
+        self, tmp_path: Path, frontend: str, call: str, expected: str
+    ) -> None:
+        """Ask the socket helper where the record says so, polkit's services otherwise."""
+        record = tmp_path / "operations.conf"
+        record.write_text(f"frontend={frontend}\n")
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        calls = tmp_path / "calls"
+        for tool in ("pmm-operations", "systemctl", "pkcon"):
+            stub = bin_dir / tool
+            stub.write_text(f'#!/bin/sh\necho "{tool} $*" >> {calls}\n')
+            stub.chmod(0o755)
+        functions = _OPERATIONS_FUNCTIONS.replace(ROOTLESS_RECORD_PATH, str(record))
+
+        subprocess.run(
+            ["sh", "-c", f"{functions}\n{call}"],
+            env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+            capture_output=True,
+            timeout=30,
+            check=True,
+        )
+
+        assert calls.read_text().splitlines() == [expected]

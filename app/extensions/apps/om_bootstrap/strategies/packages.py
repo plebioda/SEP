@@ -731,6 +731,7 @@ def _owned_step(
     timeout_s: int = 30,
     spec: BootstrapSpec | None = None,
     rootless_body: str | None = None,
+    operations: tuple[str, ...] = (),
 ) -> StepAction:
     """Build a rollback step that does nothing on a host this run never installed.
 
@@ -741,6 +742,7 @@ def _owned_step(
         Required with ``rootless_body``.
     :param rootless_body: The body on a host with the root step, guarded by the
         instance's own marker instead.
+    :param operations: The socket helper requests ``rootless_body`` may send.
     :return: A step running ``body`` only when :data:`OWNERSHIP_MARKER_PATH`
         holds ``run_id``.
     """
@@ -750,7 +752,9 @@ def _owned_step(
     if rootless_body is None or spec is None:
         return action
     marker = shlex.quote(_rootless_marker(spec))
-    return _with_rootless(action, _owned_body(rootless_body, run_id, marker))
+    return _with_rootless(
+        action, _owned_body(rootless_body, run_id, marker), operations
+    )
 
 
 def _instance_dir(spec: BootstrapSpec) -> str:
@@ -780,14 +784,27 @@ def _rootless_unit(spec: BootstrapSpec) -> str:
     return f"pmm-mongod@{spec.port}.service"
 
 
-def _with_rootless(action: StepAction, body: str) -> StepAction:
+def _with_rootless(
+    action: StepAction, body: str, operations: tuple[str, ...] = ()
+) -> StepAction:
     """Add the body a host with the root step runs instead of ``action``'s.
+
+    The body starts with :data:`_OPERATIONS_FUNCTIONS`, so it reaches the root
+    step's grants the same way whichever front end the host has.
 
     :param action: The step as a root host runs it.
     :param body: The shell body for a host with the root step.
-    :return: ``action`` with ``rootless_command`` set; its timeout covers both.
+    :param operations: The socket helper requests ``body`` may send, which the
+        step's grant names.
+    :return: ``action`` with ``rootless_command`` and ``operations`` set; its
+        timeout covers both.
     """
-    return action.model_copy(update={"rootless_command": ["sh", "-c", body]})
+    return action.model_copy(
+        update={
+            "rootless_command": ["sh", "-c", f"{_OPERATIONS_FUNCTIONS}\n{body}"],
+            "operations": list(operations),
+        }
+    )
 
 
 def _rootless_config_body(spec: BootstrapSpec, host: str, *, with_auth: bool) -> str:
@@ -841,14 +858,50 @@ _RECORD_FUNCTION = (
     f'om_record() {{ sed -n "s/^$1=//p" {ROOTLESS_RECORD_PATH} | tail -n 1; }}'
 )
 
+#: What every rootless body starts with: the root step's grants as shell
+#: functions, through polkit (``systemctl``, ``pkcon`` and the port unit) or,
+#: where the record says ``frontend=socket``, through its socket helper
+#: (``pmm-operations``), which reads the step's grant from the environment.
+_OPERATIONS_FUNCTIONS = "\n".join(
+    [
+        _RECORD_FUNCTION,
+        'om_socket() { [ "$(om_record frontend)" = socket ]; }',
+        (
+            'om_unit() { if om_socket; then pmm-operations "$1" "$2"; '
+            'else systemctl "$1" "pmm-mongod@$2.service"; fi; }'
+        ),
+        (
+            'om_purge() { if om_socket; then pmm-operations purge "$1"; '
+            'else systemctl start "pmm-mongod-purge@$1.service"; fi; }'
+        ),
+        "om_port() {",
+        '  if om_socket; then pmm-operations port "$1" "$2"; return; fi',
+        (
+            '  if systemctl start "pmm-operations-port@$1-$2.service" 2>/dev/null; '
+            "then rc=0; else rc=$?; fi"
+        ),
+        (
+            f'  cat "{PORT_RESULT_PATH.format(port="$2")}" 2>/dev/null'
+            ' || echo "pmm-operations-port@$1-$2 failed"'
+        ),
+        '  return "$rc"',
+        "}",
+        (
+            'om_packages() { if om_socket; then pmm-operations "$@"; '
+            'else pkcon -p --noninteractive "$@"; fi; }'
+        ),
+    ]
+)
+
 
 def _port_helper(action: str, spec: BootstrapSpec, step_name: str) -> str:
     """Build the lines asking the root step's port helper to check, open or close a port.
 
-    ``pmm-operations-port@<action>-<port>`` runs as root, and polkit lets the agent
-    start it. It checks the port against the range the root step allows, then
-    opens it in firewalld and labels it for SELinux, or undoes only what it did
-    itself. Its answer goes to :data:`PORT_RESULT_PATH`, since the agent cannot
+    The helper runs as root, reached through ``om_port``: the unit
+    ``pmm-operations-port@<action>-<port>`` polkit lets the agent start, or the
+    socket helper. It checks the port against the range the root step allows,
+    then opens it in firewalld and labels it for SELinux, or undoes only what it
+    did itself, and answers in :data:`PORT_RESULT_PATH`, since the agent cannot
     read the journal. ``close`` never fails the step.
 
     :param action: ``check``, ``open`` or ``close``.
@@ -856,28 +909,28 @@ def _port_helper(action: str, spec: BootstrapSpec, step_name: str) -> str:
     :param step_name: The step, named in the failure message.
     :return: The shell lines.
     """
-    unit = f"pmm-operations-port@{action}-{spec.port}.service"
-    result = PORT_RESULT_PATH.format(port=spec.port)
-    answer = f"$(cat {result} 2>/dev/null || echo '{unit} failed')"
+    call = f"om_port {action} {spec.port}"
     if action == "close":
-        return f'systemctl start {unit} 2>/dev/null || echo "{step_name}: {answer}"'
+        return f'answer=$({call} 2>&1) || echo "{step_name}: $answer"'
     return "\n".join(
         [
-            f"if ! systemctl start {unit} 2>/dev/null; then",
-            f'  echo "{step_name}: {answer}" >&2; exit 1',
+            f"if ! answer=$({call} 2>&1); then",
+            f'  echo "{step_name}: $answer" >&2; exit 1',
             "fi",
-            f"cat {result} 2>/dev/null || true",
+            'echo "$answer"',
         ]
     )
 
 
-def _pkcon(arguments: str, step_name: str) -> str:
-    """Build the lines running one ``pkcon`` command, quiet unless it fails.
+def _packages(arguments: str, step_name: str) -> str:
+    """Build the lines running one package request, quiet unless it fails.
 
-    pkcon reports a refusal by polkit or a failed transaction on stdout, so on
-    failure the end of its output goes to stderr, where the step's detail reads it.
+    Through ``om_packages``: ``pkcon`` or the socket helper, which both report a
+    refusal or a failed transaction on stdout, so on failure the end of the
+    output goes to stderr, where the step's detail reads it.
 
-    :param arguments: pkcon's arguments, already shell-quoted.
+    :param arguments: The request (``refresh``, ``install NAME``), already
+        shell-quoted, the same for both.
     :param step_name: The step, named in the failure message.
     :return: The shell lines.
     """
@@ -885,8 +938,8 @@ def _pkcon(arguments: str, step_name: str) -> str:
         [
             "out=$(mktemp)",
             "trap 'rm -f \"$out\"' EXIT",
-            f'if ! pkcon -p --noninteractive {arguments} >"$out" 2>&1; then',
-            f'  echo "{step_name}: pkcon {arguments} failed:" >&2',
+            f'if ! om_packages {arguments} >"$out" 2>&1; then',
+            f'  echo "{step_name}: {arguments} failed:" >&2',
             '  tail -n 5 "$out" >&2; exit 1',
             "fi",
         ]
@@ -1053,7 +1106,11 @@ class PackagesInstallStrategy:
                 _port_free_check(spec.port),
             ]
         )
-        return _with_rootless(_shell_step(body), self._rootless_pre_check(spec))
+        return _with_rootless(
+            _shell_step(body),
+            self._rootless_pre_check(spec),
+            (f"port check {spec.port}",),
+        )
 
     def _rootless_pre_check(self, spec: BootstrapSpec) -> str:
         """Build ``pre_check`` for a host with the root step.
@@ -1076,15 +1133,21 @@ class PackagesInstallStrategy:
         marker = shlex.quote(_rootless_marker(spec))
         return "\n".join(
             [
-                _RECORD_FUNCTION,
                 (
                     'om_under() { p=$1; shift; for r in "$@"; do '
                     'case "$p/" in "$r"/*) return 0;; esac; done; return 1; }'
                 ),
+                "if om_socket; then",
                 (
-                    'command -v pkcon >/dev/null 2>&1 || { echo "pre_check: pkcon '
+                    '  command -v pmm-operations >/dev/null 2>&1 || { echo "pre_check: '
+                    'pmm-operations not found; the root step installs it" >&2; exit 1; }'
+                ),
+                "else",
+                (
+                    '  command -v pkcon >/dev/null 2>&1 || { echo "pre_check: pkcon '
                     'not found; the root step installs PackageKit" >&2; exit 1; }'
                 ),
+                "fi",
                 # A root step without the port helper prepared fixed ports only.
                 'range=$(om_record port_range)\nif [ -z "$range" ]; then',
                 (
@@ -1167,8 +1230,10 @@ class PackagesInstallStrategy:
             raise ValueError(f"unsupported OperatingSystem: {spec.os!r}")
         # The root step enabled the series and pre_check confirmed it; the agent
         # may only refresh the package lists.
-        rootless = _pkcon("refresh", "configure_repository")
-        return _with_rootless(_shell_step(command, timeout_s=120), rootless)
+        rootless = _packages("refresh", "configure_repository")
+        return _with_rootless(
+            _shell_step(command, timeout_s=120), rootless, ("refresh",)
+        )
 
     def _install_package(self, spec: BootstrapSpec) -> StepAction:
         """Claim the host for this run, then install ``percona-server-mongodb``.
@@ -1200,7 +1265,7 @@ class PackagesInstallStrategy:
                 f"[ -d {instance} ] || mkdir {instance}",
                 f"printf '%s\\n' {shlex.quote(run_id)} > {shlex.quote(_rootless_marker(spec))}",
                 f"if ! {installed}; then",
-                _pkcon("install percona-server-mongodb", INSTALL_PACKAGE),
+                _packages("install percona-server-mongodb", INSTALL_PACKAGE),
                 "fi",
             ]
         )
@@ -1209,7 +1274,7 @@ class PackagesInstallStrategy:
             f"{install} percona-server-mongodb",
             timeout_s=300,
         )
-        return _with_rootless(action, rootless)
+        return _with_rootless(action, rootless, ("install percona-server-mongodb",))
 
     def _configure_mongod(self, spec: BootstrapSpec, host: str) -> StepAction:
         """Write ``mongod.conf`` enabling replication, with authorization left off.
@@ -1302,14 +1367,15 @@ class PackagesInstallStrategy:
         rootless = "\n".join(
             [
                 _rootless_config_body(spec, host, with_auth=False),
-                _RECORD_FUNCTION,
                 'if [ -n "$(om_record port_range)" ]; then',
                 _port_helper("open", spec, "configure_mongod"),
                 "fi",
             ]
         )
         # semanage takes about 15s to label a port on RHEL 8.
-        return _with_rootless(_shell_step(command, timeout_s=120), rootless)
+        return _with_rootless(
+            _shell_step(command, timeout_s=120), rootless, (f"port open {spec.port}",)
+        )
 
     def _start_service(self, spec: BootstrapSpec) -> StepAction:
         """Enable the ``mongod`` systemd unit and (re)start it on the config just written.
@@ -1343,13 +1409,12 @@ class PackagesInstallStrategy:
         # polkit grants no "enable": the root step's boot unit starts every
         # instance whose hand-over directory holds an "enabled" file.
         enabled = shlex.quote(posixpath.join(_instance_dir(spec), "enabled"))
-        restart = f"systemctl restart {_rootless_unit(spec)}"
         rootless = (
             f"{_mongod_diagnostics(spec, rootless=True)}\n"
             f"touch {enabled}\n"
-            f"{_run_or_explain(restart)}\n"
+            f"{_run_or_explain(f'om_unit restart {spec.port}')}\n"
         )
-        return _with_rootless(action, rootless)
+        return _with_rootless(action, rootless, (f"restart {spec.port}",))
 
     def _verify(self, spec: BootstrapSpec) -> StepAction:
         """Confirm ``mongod`` answers before declaring this host done.
@@ -1624,10 +1689,10 @@ class PackagesInstallStrategy:
         # set -e stops the step at a failed write, before the restart.
         rootless = (
             f"{_rootless_config_body(spec, host, with_auth=True)}\n"
-            f"systemctl restart {_rootless_unit(spec)}\n"
+            f"om_unit restart {spec.port}\n"
             f"{_wait_for_mongod_command(spec.port)}\n"
         )
-        return _with_rootless(action, rootless)
+        return _with_rootless(action, rootless, (f"restart {spec.port}",))
 
     def plan_rollback_steps(self, spec: BootstrapSpec) -> list[str]:  # noqa: ARG002
         """Return this strategy's fixed per-host rollback step names.
@@ -1737,9 +1802,8 @@ class PackagesInstallStrategy:
             run_id,
             timeout_s=60,
             spec=spec,
-            rootless_body=(
-                f"rm -f {enabled}\nsystemctl stop {_rootless_unit(spec)} || true"
-            ),
+            rootless_body=f"rm -f {enabled}\nom_unit stop {spec.port} || true",
+            operations=(f"stop {spec.port}",),
         )
 
     def _rollback_remove_config(self, spec: BootstrapSpec, run_id: str) -> StepAction:
@@ -1761,7 +1825,6 @@ class PackagesInstallStrategy:
         rootless = "\n".join(
             [
                 f"rm -f {files}",
-                _RECORD_FUNCTION,
                 'if [ -n "$(om_record port_range)" ]; then',
                 _port_helper("close", spec, "remove_config"),
                 "fi",
@@ -1773,6 +1836,7 @@ class PackagesInstallStrategy:
             timeout_s=60,
             spec=spec,
             rootless_body=rootless,
+            operations=(f"port close {spec.port}",),
         )
 
     def _rollback_remove_keyfile(self, spec: BootstrapSpec, run_id: str) -> StepAction:
@@ -1833,16 +1897,17 @@ class PackagesInstallStrategy:
             timeout_s=300,
             spec=spec,
             rootless_body=self._rootless_purge_package(spec),
+            operations=(f"remove {' '.join(_ROOTLESS_PACKAGES)}",),
         )
 
     def _rootless_purge_package(self, spec: BootstrapSpec) -> str:
         """Build ``purge_package`` for a host with the root step.
 
         Removes every PSMDB package the root step lets the agent remove, through
-        PackageKit, unless another instance PMM installed on the host still needs
-        them. PackageKit leaves the dependencies it pulled in itself, such as
-        ``percona-telemetry-agent``, which the grant does not name. A refused or
-        failed removal does not fail the rollback, as on a root host.
+        PackageKit or the socket helper, unless another instance PMM installed on
+        the host still needs them. PackageKit leaves the dependencies it pulled in
+        itself, such as ``percona-telemetry-agent``, which the grant does not name.
+        A refused or failed removal does not fail the rollback, as on a root host.
 
         :param spec: The host's bootstrap spec; its OS and port are read.
         :return: The shell body.
@@ -1869,6 +1934,11 @@ class PackagesInstallStrategy:
                 "    echo 'purge_package: kept for the other instances here'; exit 0",
                 "  fi",
                 "done",
+                # The socket helper takes names and removes the installed ones.
+                "if om_socket; then",
+                f"  pmm-operations remove {packages} 2>&1 | tail -n 5 || true",
+                "  exit 0",
+                "fi",
                 f"ids=$({ids})",
                 '[ -n "$ids" ] || exit 0',
                 "out=$(mktemp)",
@@ -1889,10 +1959,12 @@ class PackagesInstallStrategy:
         :return: The step action.
         """
         body = f"rm -rf {shlex.quote(spec.data_path)}\nrm -f {OWNERSHIP_MARKER_PATH}"
-        rootless = (
-            f"systemctl start pmm-mongod-purge@{spec.port}.service\n"
-            f"rm -rf {shlex.quote(_instance_dir(spec))}"
-        )
+        rootless = f"om_purge {spec.port}\nrm -rf {shlex.quote(_instance_dir(spec))}"
         return _owned_step(
-            body, run_id, timeout_s=60, spec=spec, rootless_body=rootless
+            body,
+            run_id,
+            timeout_s=60,
+            spec=spec,
+            rootless_body=rootless,
+            operations=(f"purge {spec.port}",),
         )

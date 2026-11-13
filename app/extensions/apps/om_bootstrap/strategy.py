@@ -231,11 +231,16 @@ class StepAction(BaseModel):
         :data:`ROOTLESS_RECORD_PATH`, as whoever the agent runs as, through the
         grants that record describes. ``None`` when ``command`` itself needs no
         root, so it runs on both kinds of host.
+    :param operations: The requests ``rootless_command`` may send the root step's
+        socket helper, each as the helper reads it (``restart 27017``). A host
+        whose helper takes only signed requests runs them under a grant naming
+        exactly these.
     """
 
     command: list[str]
     timeout_s: int = 120
     rootless_command: list[str] | None = None
+    operations: list[str] = []
 
 
 class StepRecord(BaseModel):
