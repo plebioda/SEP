@@ -16,6 +16,7 @@
 """Assert PackagesInstallStrategy plans the same steps and builds OS-correct actions."""
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -2169,7 +2170,7 @@ class TestRootlessCommands:
         assert "processManagement" not in config
         assert config["security"]["keyFile"] == "/run/mongodb/pmm-27017/keyfile"
         assert "om_unit restart 27017" in body
-        assert action.operations == ["restart 27017"]
+        assert action.operations[-1] == "restart 27017"
 
     @pytest.mark.parametrize(
         ("kind", "step_name", "action"),
@@ -2195,7 +2196,7 @@ class TestRootlessCommands:
         body = _body(built.rootless_command)
         assert "om_record port_range" in body
         assert f"om_port {action} 27017" in body
-        assert built.operations == [f"port {action} 27017"]
+        assert f"port {action} 27017" in built.operations
 
     def test_rootless_rollback_is_guarded_by_the_instance_marker(self) -> None:
         """Touch nothing unless the instance's own marker names this run."""
@@ -2215,8 +2216,12 @@ class TestRootlessCommands:
             ("step", "pre_check", ["port check 27017"]),
             ("step", "configure_repository", ["refresh"]),
             ("step", "install_package", ["install percona-server-mongodb"]),
-            ("step", "distribute_keyfile", []),
-            ("step", "configure_mongod", ["port open 27017"]),
+            ("step", "distribute_keyfile", [r"keyfile apply 27017 [0-9a-f]{64}"]),
+            (
+                "step",
+                "configure_mongod",
+                [r"config apply 27017 [0-9a-f]{64}", "port open 27017"],
+            ),
             ("step", "start_service", ["restart 27017"]),
             ("step", "verify", []),
             ("rollback", "stop_service", ["stop 27017"]),
@@ -2242,9 +2247,61 @@ class TestRootlessCommands:
             else strategy.build_rollback_step(step_name, "node00", spec)
         )
 
-        assert built.operations == operations
+        assert len(built.operations) == len(operations)
+        assert all(
+            re.fullmatch(pattern, request)
+            for pattern, request in zip(operations, built.operations, strict=True)
+        )
         assert built.rootless_command is not None
         assert _body(built.rootless_command).startswith(_OPERATIONS_FUNCTIONS)
+
+    @pytest.mark.parametrize(
+        ("kind", "step_name"),
+        [
+            ("step", "distribute_keyfile"),
+            ("step", "configure_mongod"),
+            ("finalize", "enable_auth"),
+        ],
+    )
+    def test_root_gets_exactly_what_the_grant_pins(
+        self, tmp_path: Path, kind: str, step_name: str
+    ) -> None:
+        """Send the socket helper the content whose SHA-256 the step's request names."""
+        strategy = PackagesInstallStrategy()
+        spec = _spec(OperatingSystem.ROCKY)
+        built = (
+            strategy.build_step(step_name, "node00", spec, _STEP_PARAMS.get(step_name))
+            if kind == "step"
+            else strategy.build_finalize_step(step_name, "node00", spec)
+        )
+        request = built.operations[0]
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        sent, args = tmp_path / "sent", tmp_path / "args"
+        (bin_dir / "pmm-operations").write_text(
+            f'#!/bin/sh\ncase $1 in config|keyfile) cat > {sent}; echo "$*" > {args};; esac\n'
+        )
+        (bin_dir / "pmm-operations").chmod(0o755)
+        # The functions, with the record answering "socket" and no wait for mongod.
+        assert built.rootless_command is not None
+        body = _body(built.rootless_command).replace(
+            'om_socket() { [ "$(om_record frontend)" = socket ]; }',
+            "om_socket() { true; }",
+        )
+        script = body.split("om_unit restart")[0]
+
+        subprocess.run(
+            [_SH, "-c", script],
+            env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+
+        assert args.read_text().strip() == request
+        assert hashlib.sha256(sent.read_bytes()).hexdigest() == request.split()[-1]
+        if step_name == "distribute_keyfile":
+            assert sent.read_text() == _STEP_PARAMS[step_name]["key_file_content"]
 
     @pytest.mark.parametrize(
         ("frontend", "call", "expected"),

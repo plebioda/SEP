@@ -53,6 +53,7 @@ instance's own hand-over directory.
 """
 
 import base64
+import hashlib
 import json
 import posixpath
 import shlex
@@ -807,25 +808,43 @@ def _with_rootless(
     )
 
 
-def _rootless_config_body(spec: BootstrapSpec, host: str, *, with_auth: bool) -> str:
+def _rootless_config(
+    spec: BootstrapSpec, host: str, *, with_auth: bool, step_name: str
+) -> tuple[str, str]:
     """Build the lines handing the instance's config to ``pmm-mongod@<port>``.
 
-    Writes ``mongod.conf``, readable by group ``mongod``, plus ``dirs``, the data
-    and log directories the unit creates as ``mongod`` before it starts, and
-    ``purge``, what the purge unit deletes on rollback. The config is written
-    beside its final name and moved over it, so the unit never copies half a file.
+    Through the socket helper, the config goes to root with its SHA-256 in the
+    request, which the step's grant names, so the host writes only this content,
+    where the agent cannot change it, and derives the directories mongod creates
+    and purges from it. Through polkit, the agent writes ``mongod.conf``, readable
+    by group ``mongod``, into the hand-over directory, plus ``dirs``, the data and
+    log directories the unit creates as ``mongod`` before it starts, and ``purge``,
+    what the purge unit deletes on rollback; the config beside its final name and
+    then moved over it, so the unit never copies half a file.
 
     :param spec: The host's bootstrap spec.
     :param host: The host being configured, which decides its ``bindIp``.
     :param with_auth: Whether to include ``security.authorization``/``keyFile``.
-    :return: The shell lines.
+    :param step_name: The step, named in the failure message.
+    :return: The shell lines, and the socket helper request they send.
     """
     config = _mongod_config(spec, host, with_auth=with_auth, rootless=True)
+    request = f"config apply {spec.port} {hashlib.sha256(config.encode()).hexdigest()}"
     instance = _instance_dir(spec)
     conf = shlex.quote(posixpath.join(instance, "mongod.conf"))
     data_path = shlex.quote(spec.data_path)
     log_dir = shlex.quote(posixpath.dirname(spec.log_path))
-    return "\n".join(
+    socket = "\n".join(
+        [
+            "conf=$(mktemp)",
+            f"cat > \"$conf\" <<'MONGOD_CONF'\n{config}MONGOD_CONF",
+            f'if ! out=$(pmm-operations {request} < "$conf" 2>&1); then',
+            f'  echo "{step_name}: $out" >&2; rm -f "$conf"; exit 1',
+            "fi",
+            'rm -f "$conf"',
+        ]
+    )
+    handover = "\n".join(
         [
             "umask 0027",
             (
@@ -840,6 +859,7 @@ def _rootless_config_body(spec: BootstrapSpec, host: str, *, with_auth: bool) ->
             f"mv -f {conf}.new {conf}",
         ]
     )
+    return f"if om_socket; then\n{socket}\nelse\n{handover}\nfi", request
 
 
 #: What ``purge_package`` removes on a host with the root step: the packages its
@@ -1043,16 +1063,26 @@ class PackagesInstallStrategy:
         # Group mongod through the hand-over directory's setgid; the unit copies it
         # to mode 400 as mongod.
         key_file = shlex.quote(posixpath.join(_instance_dir(spec), "keyfile"))
+        # Through the socket helper root keeps it, the SHA-256 the grant names.
+        digest = hashlib.sha256(params["key_file_content"].encode()).hexdigest()
+        request = f"keyfile apply {spec.port} {digest}"
         rootless = (
-            "umask 0227\n"
-            f"printf '%s' {shlex.quote(encoded)} | base64 -d > {key_file}.new\n"
-            f"mv -f {key_file}.new {key_file}\n"
+            "if om_socket; then\n"
+            f"  if ! out=$(printf '%s' {shlex.quote(encoded)} | base64 -d | "
+            f"pmm-operations {request} 2>&1); then\n"
+            '    echo "distribute_keyfile: $out" >&2; exit 1\n'
+            "  fi\n"
+            "else\n"
+            "  umask 0227\n"
+            f"  printf '%s' {shlex.quote(encoded)} | base64 -d > {key_file}.new\n"
+            f"  mv -f {key_file}.new {key_file}\n"
+            "fi\n"
         )
         action = _shell_step(
             f"printf '%s' {shlex.quote(encoded)} | base64 -d | "
             f"install -m 400 -o mongod -g mongod /dev/stdin {KEY_FILE_PATH}"
         )
-        return _with_rootless(action, rootless)
+        return _with_rootless(action, rootless, (request,))
 
     def _pre_check(self, spec: BootstrapSpec) -> StepAction:
         """Verify OS, paths, and disk space before touching anything.
@@ -1364,9 +1394,12 @@ class PackagesInstallStrategy:
             f"install -d -m 750 -o mongod -g mongod {quoted_log_dir} ; }} && "
             f"cat > {CONFIG_PATH} <<'MONGOD_CONF'\n{config}MONGOD_CONF\n"
         )
+        config_body, config_request = _rootless_config(
+            spec, host, with_auth=False, step_name="configure_mongod"
+        )
         rootless = "\n".join(
             [
-                _rootless_config_body(spec, host, with_auth=False),
+                config_body,
                 'if [ -n "$(om_record port_range)" ]; then',
                 _port_helper("open", spec, "configure_mongod"),
                 "fi",
@@ -1374,7 +1407,9 @@ class PackagesInstallStrategy:
         )
         # semanage takes about 15s to label a port on RHEL 8.
         return _with_rootless(
-            _shell_step(command, timeout_s=120), rootless, (f"port open {spec.port}",)
+            _shell_step(command, timeout_s=120),
+            rootless,
+            (config_request, f"port open {spec.port}"),
         )
 
     def _start_service(self, spec: BootstrapSpec) -> StepAction:
@@ -1687,12 +1722,17 @@ class PackagesInstallStrategy:
             command, timeout_s=MONGOD_RESTART_ALLOWANCE_S + _wait_for_mongod_max_s()
         )
         # set -e stops the step at a failed write, before the restart.
+        config_body, config_request = _rootless_config(
+            spec, host, with_auth=True, step_name="enable_auth"
+        )
         rootless = (
-            f"{_rootless_config_body(spec, host, with_auth=True)}\n"
+            f"{config_body}\n"
             f"om_unit restart {spec.port}\n"
             f"{_wait_for_mongod_command(spec.port)}\n"
         )
-        return _with_rootless(action, rootless, (f"restart {spec.port}",))
+        return _with_rootless(
+            action, rootless, (config_request, f"restart {spec.port}")
+        )
 
     def plan_rollback_steps(self, spec: BootstrapSpec) -> list[str]:  # noqa: ARG002
         """Return this strategy's fixed per-host rollback step names.
