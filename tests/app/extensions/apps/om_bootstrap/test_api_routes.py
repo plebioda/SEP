@@ -35,7 +35,7 @@ import pytest
 from fastapi import FastAPI, HTTPException, status
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.api.deps import minimum_role_for
+from app.api.deps import minimum_role_for, SERVICE_PRINCIPAL_ID
 from app.core.auth.models import UserRole
 from app.core.auth.providers.casdoor.models import CasdoorUser
 from app.extensions.apps.om_bootstrap.api_routes import (
@@ -175,6 +175,35 @@ class TestTriggerRun:
                 for step in host["steps"]
                 if step["name"] != "pre_check"
             )
+
+    @pytest.mark.parametrize("caller", ["user", "service"])
+    def test_records_who_asked_for_the_run(
+        self, regular_user: CasdoorUser, session: AsyncSession, caller: str
+    ) -> None:
+        """Keep the user PMM created the run for; nobody for the service principal."""
+        user = (
+            CasdoorUser.build_service_principal(
+                user_id=SERVICE_PRINCIPAL_ID,
+                username="extensions-service",
+                role=UserRole.VIEWER,
+            )
+            if caller == "service"
+            else regular_user
+        )
+        response = api_client(user, session, _fake_tasks_api()).post(
+            f"{BASE}/runs",
+            json={
+                "hosts": ["node00"],
+                "install_method": "packages",
+                "os": "ubuntu",
+                "mongodb_version": "8.0",
+                "replica_set_name": "rs-test",
+            },
+        )
+
+        assert response.status_code == status.HTTP_201_CREATED
+        expected = "" if caller == "service" else regular_user.username
+        assert response.json()["requested_by"] == expected
 
     def test_accepts_per_host_member_configs(
         self, regular_user: CasdoorUser, session: AsyncSession
@@ -897,10 +926,13 @@ class TestDispatchRunStep:
 class TestDispatchRunRunStep:
     """Assert POST .../run-steps/{name}:dispatch targets the seed host."""
 
-    async def _seed_run(self, session: AsyncSession) -> BootstrapRun:
+    async def _seed_run(
+        self, session: AsyncSession, requested_by: str = ""
+    ) -> BootstrapRun:
         return await BootstrapRunManager.save(
             session,
             BootstrapRunFactory.build(
+                requested_by=requested_by,
                 hosts=dump_host_states(
                     [
                         HostBootstrapState(
@@ -945,6 +977,25 @@ class TestDispatchRunRunStep:
         assert dispatch_step_mock.call_args.args[3] == "node00"
         run_step = response.json()["run_steps"][0]
         assert run_step["status"] == "running"
+
+    @pytest.mark.asyncio
+    async def test_passes_on_who_asked_for_the_run(
+        self, regular_user: CasdoorUser, session: AsyncSession
+    ) -> None:
+        """Hand the dispatch the run's requester, whom the step's grant names."""
+        run = await self._seed_run(session, requested_by="alice")
+        dispatch_step_mock = AsyncMock(return_value=FAKE_TASK_HISTORY_ID)
+
+        with patch(
+            "app.extensions.apps.om_bootstrap.api_routes.dispatch_step",
+            dispatch_step_mock,
+        ):
+            response = api_client(regular_user, session, _fake_tasks_api()).post(
+                f"{BASE}/runs/{run.id}/run-steps/rs_initiate:dispatch"
+            )
+
+        assert response.status_code == status.HTTP_202_ACCEPTED
+        assert dispatch_step_mock.call_args.kwargs["requested_by"] == "alice"
 
     @pytest.mark.asyncio
     async def test_dispatches_a_planned_admin_user_with_its_params(

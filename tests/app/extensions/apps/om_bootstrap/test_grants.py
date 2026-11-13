@@ -47,13 +47,16 @@ def key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ec.EllipticCurvePriv
     return private
 
 
-def _sign(operations: list[str], ttl_s: int = TTL_S) -> str | None:
+def _sign(
+    operations: list[str], ttl_s: int = TTL_S, requested_by: str = "alice"
+) -> str | None:
     return grants.sign_grant(
         node="node00",
         run_id="run-1",
         step="start_service",
         operations=operations,
         ttl_s=ttl_s,
+        requested_by=requested_by,
     )
 
 
@@ -91,11 +94,22 @@ class TestSignGrant:
         assert values["node"] == "node00"
         assert values["run"] == "run-1"
         assert values["step"] == "start_service"
+        assert values["by"] == "alice"
         assert int(values["until"]) - int(values["issued"]) == TTL_S
         assert [v for k, v in fields if k == "allow"] == [
             "restart 27017",
             "port open 27017",
         ]
+
+    def test_the_service_principal_is_named_as_such(
+        self, key: ec.EllipticCurvePrivateKey
+    ) -> None:
+        """Name PMM Extensions when no user asked for the run."""
+        grant = _sign(["restart 27017"], requested_by="")
+
+        assert grant is not None
+        payload, _ = _split(grant)
+        assert "by=pmm-extensions" in payload.decode().splitlines()
 
     def test_the_signature_verifies_with_the_public_key(
         self, key: ec.EllipticCurvePrivateKey

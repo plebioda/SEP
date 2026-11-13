@@ -140,6 +140,8 @@ class BootstrapRun(BaseUUIDSQLModel, table=True):
     :param error: The failure detail when the run itself raised, outside any
         single host's steps — e.g. a spec that failed validation before any
         host was touched.
+    :param requested_by: The username of who asked for the run, empty for the
+        service principal.
     """
 
     __tablename__ = "bootstrap_run"
@@ -190,6 +192,9 @@ class BootstrapRun(BaseUUIDSQLModel, table=True):
     # decides nothing from it; it only ever records the request and best-effort
     # stops whatever is currently dispatching (see api_routes.py's cancel_run).
     cancel_requested: bool = SQLField(default=False)
+    # Who PMM created the run for: the authenticated user, or empty when PMM Extensions'
+    # own service principal did. Every step's grant for a host's root step names them.
+    requested_by: str = SQLField(default="", sa_type=Text)
 
     # JSON, not postgresql.JSONB directly: PostgreSQL is the dialect that gets a
     # variant carved out of it here, same reasoning as ProbeRun.nodes.

@@ -51,7 +51,7 @@ from fastapi import status as http_status
 from pydantic import BaseModel, Field, StringConstraints
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.api.deps import require_minimum_role
+from app.api.deps import require_minimum_role, SERVICE_PRINCIPAL_ID
 from app.core.auth.models import UserRole
 from app.core.exceptions import (
     HTTPBadRequestException,
@@ -93,7 +93,7 @@ from app.extensions.apps.om_bootstrap.strategy import (
     StepRecord,
     StepStatus,
 )
-from app.extensions.deps import SessionDep, TasksClient
+from app.extensions.deps import ApiCurrentUser, SessionDep, TasksClient
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +241,8 @@ class RunResponse(BaseModel):
         see :func:`cancel_run`. PMM's stepper treats this the same as a step
         exhausting its retries (force every host's rollback), never something
         ``om_bootstrap`` itself acts on.
+    :param requested_by: The username of who asked for the run, empty when PMM
+        Extensions' own service principal did.
     """
 
     id: UUID
@@ -260,6 +262,7 @@ class RunResponse(BaseModel):
     run_steps: list[StepRecord]
     error: str | None
     cancel_requested: bool
+    requested_by: str
 
 
 def _run_response(
@@ -298,6 +301,7 @@ def _run_response(
         run_steps=run_steps if run_steps is not None else parse_run_steps(run),
         error=run.error,
         cancel_requested=run.cancel_requested,
+        requested_by=run.requested_by,
     )
 
 
@@ -426,7 +430,13 @@ async def _dispatch_and_record(
     try:
         with tasks_api.auth(get_internal_token()):
             task_history_id = await dispatch_step(
-                tasks_api, request, str(run.id), target_host, step.name, action
+                tasks_api,
+                request,
+                str(run.id),
+                target_host,
+                step.name,
+                action,
+                requested_by=run.requested_by,
             )
     except (HTTPException, RuntimeError, aiohttp.ClientError, OSError) as exc:
         detail = exc.detail if isinstance(exc, HTTPException) else str(exc) or repr(exc)
@@ -458,16 +468,21 @@ schema_endpoint(router=router, plugin_schema=om_bootstrap_schema)
 
 @router.post("/runs", status_code=http_status.HTTP_201_CREATED)
 @require_minimum_role(UserRole.ADMIN)
-async def trigger_run(session: SessionDep, request: TriggerRunRequest) -> RunResponse:
+async def trigger_run(
+    session: SessionDep, request: TriggerRunRequest, user: ApiCurrentUser
+) -> RunResponse:
     """Create a bootstrap run, planning every host's steps up front.
 
     Dispatches nothing: creating a run only plans it, so the caller (PMM's
     driver) sees the full step list for every host before anything is touched.
     Actually starting a host's first step is a separate call to
-    :func:`dispatch_run_step`.
+    :func:`dispatch_run_step`. PMM creates the run with the credential of whoever
+    asked for it, and dispatches its steps as itself, so the run keeps who
+    asked: each step's grant names them.
 
     :param session: The database session.
     :param request: The requested run.
+    :param user: Who asked for the run.
     :raises HTTPBadRequestException: When ``request.hosts`` is empty, lists the
         same host twice, has neither one nor three hosts, names an install
         method with no registered strategy, ``member_configs`` names a host
@@ -546,6 +561,7 @@ async def trigger_run(session: SessionDep, request: TriggerRunRequest) -> RunRes
             },
             hosts=dump_host_states(host_states),
             run_steps=dump_run_steps(run_steps),
+            requested_by="" if user.id == SERVICE_PRINCIPAL_ID else user.username,
         ),
     )
     return _run_response(run, hosts=host_states, run_steps=run_steps)

@@ -45,12 +45,18 @@ GRANT_ENV_VAR = "PMM_OPERATIONS_GRANT"
 #: start it, and the step's own timeout only starts then.
 GRANT_SLACK_S = 600
 
-#: Who asked, until PMM passes the admin who started the run.
-_REQUESTER = "pmm"
+#: Who a grant names when PMM Extensions' own service principal asked for the run.
+_SERVICE = "pmm-extensions"
 
 
 def sign_grant(
-    *, node: str, run_id: str, step: str, operations: list[str], ttl_s: int
+    *,
+    node: str,
+    run_id: str,
+    step: str,
+    operations: list[str],
+    ttl_s: int,
+    requested_by: str = "",
 ) -> str | None:
     """Sign a grant for ``operations`` on ``node``, valid for ``ttl_s`` seconds.
 
@@ -59,6 +65,7 @@ def sign_grant(
     :param step: The step's name.
     :param operations: The exact requests the grant allows.
     :param ttl_s: How long it stays valid, in seconds.
+    :param requested_by: Who asked for the run; empty for the service principal.
     :return: The grant, or ``None`` when there is nothing to grant or no key to
         sign with.
     :raises ValueError: If a value would break the payload's lines.
@@ -67,7 +74,7 @@ def sign_grant(
     key_path = om_bootstrap_settings.OPERATIONS_GRANT_KEY
     if not operations or not key_path:
         return None
-    if any("\n" in value for value in (node, run_id, step, *operations)):
+    if any("\n" in value for value in (node, run_id, step, requested_by, *operations)):
         raise ValueError("a grant value contains a newline")
     key = serialization.load_pem_private_key(Path(key_path).read_bytes(), password=None)
     if not isinstance(key, ec.EllipticCurvePrivateKey):
@@ -78,7 +85,7 @@ def sign_grant(
         f"node={node}",
         f"run={run_id}",
         f"step={step}",
-        f"by={_REQUESTER}",
+        f"by={requested_by or _SERVICE}",
         f"issued={now}",
         f"until={now + ttl_s}",
         *(f"allow={operation}" for operation in operations),

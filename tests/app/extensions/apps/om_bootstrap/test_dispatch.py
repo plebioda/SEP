@@ -172,7 +172,7 @@ class TestBuildStepScript:
         )
         with patch.object(dispatch, "sign_grant", return_value="p.s") as sign:
             path, _ = await dispatch.write_step_script(
-                "run-grant", "node00", "start_service", action
+                "run-grant", "node00", "start_service", action, "alice"
             )
         try:
             assert "export PMM_OPERATIONS_GRANT=p.s" in path.read_text()
@@ -185,6 +185,7 @@ class TestBuildStepScript:
             step="start_service",
             operations=["restart 27017"],
             ttl_s=60 + dispatch.GRANT_SLACK_S,
+            requested_by="alice",
         )
 
     def test_quotes_arguments_containing_spaces(self) -> None:

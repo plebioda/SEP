@@ -240,7 +240,7 @@ def _write_private(path: Path, data: bytes) -> None:
 
 
 async def write_step_script(
-    run_id: str, host: str, step_name: str, action: StepAction
+    run_id: str, host: str, step_name: str, action: StepAction, requested_by: str = ""
 ) -> tuple[Path, str]:
     """Write a step's script into the scratch directory.
 
@@ -257,6 +257,7 @@ async def write_step_script(
     :param host: The node name being bootstrapped.
     :param step_name: The step's name.
     :param action: The step's action.
+    :param requested_by: Who asked for the run, named in the grant.
     :return: The written file's path, and its MD5 digest —
         :class:`~app.extensions.snippets.models.snippet.SnippetExecutionMeta` requires
         the digest to verify the download on the executor side.
@@ -267,6 +268,7 @@ async def write_step_script(
         step=step_name,
         operations=action.operations,
         ttl_s=action.timeout_s + GRANT_SLACK_S,
+        requested_by=requested_by,
     )
     data = build_step_script(action, grant).encode("utf-8")
     path = step_scripts_dir() / step_script_filename(run_id, host, step_name)
@@ -312,6 +314,7 @@ async def dispatch_step(
     host: str,
     step_name: str,
     action: StepAction,
+    requested_by: str = "",
 ) -> int:
     """Dispatch one step's action to ``host`` and return its task history id.
 
@@ -331,12 +334,13 @@ async def dispatch_step(
     :param host: The node name being bootstrapped.
     :param step_name: The step's name.
     :param action: The step's action.
+    :param requested_by: Who asked for the run, named in the step's grant.
     :return: The dispatched run's task history id.
     :raises RuntimeError: When the Tasks API accepts the dispatch but returns no
         history id.
     """
     filename = step_script_filename(run_id, host, step_name)
-    _, digest = await write_step_script(run_id, host, step_name, action)
+    _, digest = await write_step_script(run_id, host, step_name, action, requested_by)
     try:
         return await _post_step_script(tasks_api, request, host, filename, digest)
     except Exception:
