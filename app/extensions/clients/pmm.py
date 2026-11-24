@@ -19,6 +19,7 @@ import asyncio
 import logging
 from collections import defaultdict
 from collections.abc import Callable
+from datetime import datetime, UTC
 from typing import Any, ClassVar, NoReturn
 
 from aiohttp import ClientResponse, ClientResponseError
@@ -221,6 +222,45 @@ class PMMInventorySnapshot(BaseModel):
 
     nodes: list[Node]
     diagnostics: PMMFetchDiagnostics
+
+
+#: Base path of pmm-managed's Operations writer-hold API; the three verbs append
+#: ``:acquire`` / ``:heartbeat`` / ``:release``.
+_WRITER_HOLDS_PATH = "/v1/om/writerHolds"
+
+
+def _rfc3339(moment: datetime) -> str:
+    """Render ``moment`` as the RFC 3339 UTC string pmm-managed parses as a Timestamp.
+
+    :param moment: The instant to render; naive values are read as UTC.
+    :return: The instant in UTC with a trailing ``Z``.
+    """
+    return moment.astimezone(UTC).isoformat().replace("+00:00", "Z")
+
+
+class WriterHoldConflict(BaseModel):
+    """Name the Operations holder a writer-hold acquire lost to.
+
+    :param holder_operation_id: The operation already holding a conflicting lock.
+    :param holder_mode: The lock mode the holder holds.
+    :param requested_mode: The lock mode the writer requested.
+    """
+
+    holder_operation_id: str = ""
+    holder_mode: str = ""
+    requested_mode: str = ""
+
+
+class AcquireWriterHoldResult(BaseModel):
+    """Report whether a writer hold was taken, or who holds it.
+
+    :param acquired: Whether the cluster and member locks were taken; ``False``
+        with no ``conflict`` means no service is a live managed-cluster member.
+    :param conflict: The holder when the acquire lost a conflict, else ``None``.
+    """
+
+    acquired: bool = False
+    conflict: WriterHoldConflict | None = None
 
 
 class PMMRemoteAPI(StoredCredentialHeaderMixin, RemoteAPI):
@@ -1153,3 +1193,52 @@ class PMMRemoteAPI(StoredCredentialHeaderMixin, RemoteAPI):
         else:
             data = await self.get("/v1/management/services")
         return data.get("services", [])
+
+    async def acquire_writer_hold(
+        self, job_id: str, service_ids: list[str], deadline: datetime
+    ) -> AcquireWriterHoldResult:
+        """Take the Operations writer locks a PBM-writing backup needs on a cluster.
+
+        Idempotent per ``job_id``: a retry under the same id reuses the hold. A
+        conflict is a normal result naming the holder, not an exception.
+
+        :param job_id: The backup job's durable id, keying the hold.
+        :param service_ids: The PMM service ids the writer acts on; only live
+            managed-cluster members are locked.
+        :param deadline: When the hold's lease lapses unless heartbeated.
+        :return: Whether the locks were taken, or who holds them.
+        :raises HTTPException: If pmm-managed answers with an error status.
+        """
+        data = as_json_object(
+            await self.post(
+                f"{_WRITER_HOLDS_PATH}:acquire",
+                json={
+                    "job_id": job_id,
+                    "service_ids": service_ids,
+                    "deadline": _rfc3339(deadline),
+                },
+            )
+        )
+        return AcquireWriterHoldResult.model_validate(data)
+
+    async def heartbeat_writer_hold(self, job_id: str, deadline: datetime) -> None:
+        """Extend a writer hold's lease so the reaper does not reclaim it.
+
+        :param job_id: The backup job whose hold to extend.
+        :param deadline: The new lease deadline.
+        :raises HTTPException: If pmm-managed answers with an error status.
+        """
+        await self.post(
+            f"{_WRITER_HOLDS_PATH}:heartbeat",
+            json={"job_id": job_id, "deadline": _rfc3339(deadline)},
+        )
+
+    async def release_writer_hold(self, job_id: str) -> None:
+        """Drop a writer hold's locks on the backup job's terminal result.
+
+        A no-op once released, so a retry or a double release is safe.
+
+        :param job_id: The backup job whose hold to release.
+        :raises HTTPException: If pmm-managed answers with an error status.
+        """
+        await self.post(f"{_WRITER_HOLDS_PATH}:release", json={"job_id": job_id})
