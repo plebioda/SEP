@@ -24,6 +24,7 @@ covered against real PostgreSQL in ``test_om_observation_postgres.py``.
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, nullcontext
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -38,7 +39,11 @@ from app.extensions.apps.om_inventory.models import (
     ProbeRunStatus,
     ScanProfile,
 )
-from app.extensions.apps.om_inventory.service import run_scan
+from app.extensions.apps.om_inventory.service import (
+    _probe_facts_from_record,
+    run_scan,
+)
+from app.extensions.apps.shared.om.classification import ingestible_facts
 
 
 def _session_maker(
@@ -88,10 +93,11 @@ def _subject(subject_key: str, host: str) -> dict:
     }
 
 
-def _host_result(host: str) -> HostProbeResult:
+def _host_result(host: str, records: dict[str, dict] | None = None) -> HostProbeResult:
     """Build a probe result carrying a host record with scan output.
 
     :param host: The executor host the result is for.
+    :param records: The per-target records keyed by service id, if any.
     :return: The result, as :func:`probe_all` returns one.
     """
     return HostProbeResult(
@@ -100,17 +106,22 @@ def _host_result(host: str) -> HostProbeResult:
             "systemd_units": {"mongod": "ActiveState=active"},
             "pbm_status": '{"running": {}}',
         },
+        records=records or {},
     )
 
 
 @asynccontextmanager
 async def _patched(
-    session: AsyncSession, results: dict[str, HostProbeResult]
+    session: AsyncSession,
+    results: dict[str, HostProbeResult],
+    service: object | None = None,
 ) -> AsyncIterator[AsyncMock]:
     """Patch the run's dispatch and ingest seams, yielding the ingest mock.
 
     :param session: The test session the run reuses.
     :param results: What the mocked ``probe_all`` returns, keyed by host.
+    :param service: The service ``get_service`` resolves for every subject, or
+        ``None`` so a subject contributes no probe target.
     :return: The ``ingest_collected`` mock, so a test can assert on it.
     """
     ingest = AsyncMock(return_value=True)
@@ -123,6 +134,7 @@ async def _patched(
         patch.object(service_module, "_heartbeat", _no_heartbeat),
         patch.object(service_module, "_held_clients", _held_clients),
         patch.object(service_module, "get_internal_token", return_value="tok"),
+        patch.object(service_module, "get_service", AsyncMock(return_value=service)),
         patch.object(
             service_module, "probe_all", AsyncMock(return_value=results)
         ) as probe_all,
@@ -187,6 +199,36 @@ class TestRunScan:
         assert first["probe_facts"] is None
         stored = await ProbeRunManager.get(session, id=run.id)
         assert stored.status == ProbeRunStatus.SUCCESS
+
+    @pytest.mark.asyncio
+    async def test_folds_in_classified_probe_facts_for_a_known_service(
+        self, session: AsyncSession
+    ) -> None:
+        """Carry a subject's classified probe facts, dropping its secret-ish fields.
+
+        :param session: The database session.
+        """
+        run = await ProbeRunManager.save(
+            session,
+            ProbeRun(profile=ScanProfile.MANAGED, subjects=[_subject("m-1", "host-a")]),
+        )
+        record = {
+            "binary_version": "7.0.14",
+            "database": {"set_name": "rs0", "state": 1},
+            "process": {"running": True, "argv": ["--keyFile", "/etc/mongod.key"]},
+        }
+        results = {"host-a": _host_result("host-a", records={"svc-m-1": record})}
+        service = SimpleNamespace(name="rs0-svc", port=27017)
+
+        async with _patched(session, results, service=service) as ingest:
+            await run_scan(run.id)
+
+        probe_facts = ingest.await_args.kwargs["probe_facts"]
+        assert probe_facts is not None
+        kept = ingestible_facts(probe_facts["facts"], probe_facts["classes"])
+        assert kept["database.set_name"] == "rs0"
+        assert kept["binary_version"] == "7.0.14"
+        assert "process.argv" not in kept
 
     @pytest.mark.asyncio
     async def test_partial_when_a_subject_host_did_not_answer(
@@ -277,3 +319,43 @@ class TestBuildConfigScanUnits:
     def test_the_monitored_sweep_config_is_unchanged(self) -> None:
         """Leave ``scan_units`` out of the config when the sweep sends none."""
         assert "scan_units" not in json.loads(build_config([]))
+
+
+class TestProbeFactClassification:
+    """Assert the probe-fact allowlist keeps the safe facts and drops the rest."""
+
+    def test_allowlists_public_and_drops_unclassified(self) -> None:
+        """Keep topology and version facts, drop argv, raw config and the host name."""
+        record = {
+            "status": "ok",
+            "binary_version": "7.0.14",
+            "system": {"os_name": "Ubuntu 24.04", "hostname": "internal-box-07"},
+            "process": {
+                "running": True,
+                "program": "mongod",
+                "argv": ["--keyFile", "/etc/mongod.key"],
+                "config_path": "/etc/mongod.conf",
+            },
+            "database": {
+                "set_name": "rs0",
+                "state": 1,
+                "raw": {"cmd_line_opts": {"security": {"keyFile": "/etc/mongod.key"}}},
+            },
+        }
+        probe_facts = _probe_facts_from_record(record)
+        kept = ingestible_facts(probe_facts["facts"], probe_facts["classes"])
+
+        assert kept["binary_version"] == "7.0.14"
+        assert kept["system.os_name"] == "Ubuntu 24.04"
+        assert kept["process.program"] == "mongod"
+        assert kept["process.running"] is True
+        assert kept["database.set_name"] == "rs0"
+        assert kept["database.state"] == 1
+        for dropped in (
+            "process.argv",
+            "process.config_path",
+            "system.hostname",
+            "database.raw.cmd_line_opts.security.keyFile",
+            "status",
+        ):
+            assert dropped not in kept

@@ -33,7 +33,7 @@ live until there is a second caller to justify one.
 import asyncio
 import logging
 from collections import Counter
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager, AsyncExitStack
 from dataclasses import dataclass
 from dataclasses import field as dc_field
@@ -57,6 +57,7 @@ from app.extensions.apps.om_inventory.crud import (
     conflict_detail,
     conflicting_run,
     fail_running_run,
+    get_service,
     ProbeRunManager,
     prune_runs,
     RUN_LEASE,
@@ -77,6 +78,7 @@ from app.extensions.apps.om_inventory.enumeration import (
     list_inventory_nodes,
 )
 from app.extensions.apps.om_inventory.inventory import (
+    DEFAULT_MONGODB_PORT,
     InventoryService,
     list_mongodb_services,
 )
@@ -84,13 +86,16 @@ from app.extensions.apps.om_inventory.mapping import (
     ExecutorState,
     get_executor_states,
     map_services,
+    MappedService,
     usable_executor_hosts,
 )
 from app.extensions.apps.om_inventory.models import (
     NodeResolution,
+    OmService,
     ProbeRun,
     ProbeRunStatus,
     ScanFailure,
+    ScanProfile,
     ScanSubject,
 )
 from app.extensions.apps.om_inventory.observations import ingest_collected
@@ -98,6 +103,7 @@ from app.extensions.apps.om_inventory.payload.probe import (
     CLUSTER_ROLE_CONFIGSVR,
     STATUS_FAILED,
 )
+from app.extensions.apps.shared.om.classification import FactClass
 from app.extensions.config import extensions_settings
 from app.extensions.db import get_async_session_maker
 from app.inventory.config import inventory_settings
@@ -1462,13 +1468,145 @@ def _scan_terminal_status(observed: int, total: int) -> ProbeRunStatus:
     return ProbeRunStatus.PARTIAL
 
 
+#: The probe-record fields a scan keeps as public facts: OS and kernel identity,
+#: process liveness, the installed binary, and MongoDB topology, version and state.
+#: Every other field a record carries is left unclassified so ``ingestible_facts``
+#: drops it fail-closed - a process ``argv`` or ``config_path`` (credentials and
+#: paths), ``database.raw`` (the raw command output, with keyFile and TLS paths),
+#: the database error detail, the host name, and the repository and readiness facts.
+PROBE_FACT_ALLOWLIST: frozenset[str] = frozenset(
+    {
+        "system.os_name",
+        "system.os_id",
+        "system.os_version_id",
+        "system.kernel",
+        "system.arch",
+        "process.running",
+        "process.program",
+        "process.pid",
+        "process.uptime_sec",
+        "binary_version",
+        "database.db_version",
+        "database.git_version",
+        "database.vendor",
+        "database.storage_engine",
+        "database.is_writable_primary",
+        "database.is_arbiter",
+        "database.set_name",
+        "database.state",
+    }
+)
+
+
+def _scan_target(subject: ScanSubject, service: OmService) -> MappedService:
+    """Build the probe target for one subject from its service and host.
+
+    :param subject: The subject to probe, carrying the host and the key its
+        observation lands under.
+    :param service: The service PMM registered for the subject, giving the port.
+    :return: The subject's service paired with its host, as the probe dispatches one.
+    """
+    inventory_service = InventoryService(
+        service_id=None,
+        external_id=subject.service_id,
+        name=service.name or subject.subject_key,
+        port=service.port or DEFAULT_MONGODB_PORT,
+        node_name=None,
+        node_address=subject.host,
+    )
+    return MappedService(inventory_service, subject.host, NodeResolution.ADDRESS)
+
+
+def _flatten_record(record: Mapping[str, Any], prefix: str = "") -> dict[str, Any]:
+    """Flatten a probe record's nested facts to a flat ``dotted.name`` map.
+
+    :param record: The parsed probe record, or a sub-document of it.
+    :param prefix: The dotted path of the sub-document being flattened.
+    :return: Every leaf value keyed by its dotted path.
+    """
+    flat: dict[str, Any] = {}
+    for key, value in record.items():
+        name = f"{prefix}{key}"
+        if isinstance(value, dict):
+            flat.update(_flatten_record(value, f"{name}."))
+        else:
+            flat[name] = value
+    return flat
+
+
+def _probe_facts_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Classify a subject's probe record into the facts and classes a scan folds in.
+
+    Every leaf is carried as a fact; only the fields in :data:`PROBE_FACT_ALLOWLIST`
+    are classified :attr:`FactClass.PUBLIC`, so every other field is dropped
+    fail-closed when the observation is ingested.
+
+    :param record: The subject's parsed probe record.
+    :return: The ``facts`` and ``classes`` mapping ``ingest_collected`` folds in.
+    """
+    facts = _flatten_record(record)
+    classes = {name: FactClass.PUBLIC for name in facts if name in PROBE_FACT_ALLOWLIST}
+    return {"facts": facts, "classes": classes}
+
+
+async def _ingest_subjects(
+    session: AsyncSession,
+    subjects: list[ScanSubject],
+    results: dict[str, HostProbeResult],
+    *,
+    profile: ScanProfile,
+    scan_id: UUID,
+    collected_at: datetime,
+) -> int:
+    """Store one observation per subject whose host answered, counting those stored.
+
+    :param session: The session to record through; committed here.
+    :param subjects: The members the scan collected on.
+    :param results: The probe results, keyed by host.
+    :param profile: The scan profile the observations belong to.
+    :param scan_id: The run the observations cite.
+    :param collected_at: When the scan began.
+    :return: The number of subjects whose observation was stored.
+    :raises sqlalchemy.exc.DBAPIError: When a subject's observation write is refused.
+    """
+    observed = 0
+    for subject in subjects:
+        result = results.get(subject.host)
+        if result is None or result.host_record is None:
+            continue
+        host_record = result.host_record
+        record = (
+            result.records.get(subject.service_id)
+            if subject.service_id is not None
+            else None
+        )
+        probe_facts = _probe_facts_from_record(record) if record is not None else None
+        applied = await ingest_collected(
+            session,
+            subject_kind=subject.subject_kind,
+            subject_key=subject.subject_key,
+            profile=profile,
+            scan_id=scan_id,
+            collected_at=collected_at,
+            systemd_units=host_record.get("systemd_units") or {},
+            pbm_status=host_record.get("pbm_status"),
+            probe_facts=probe_facts,
+        )
+        if applied:
+            observed += 1
+    await session.commit()
+    return observed
+
+
 async def run_scan(run_id: UUID) -> UUID:
     """Run one requested scan and record its subjects' observations.
 
     The run row and its subjects are created by ``POST /scans`` before the work
     starts, so this renews the lease, reads the subjects back off the row, dispatches
     the probe to each subject's host under :data:`SCAN_SYSTEMD_UNITS` to capture its
-    systemd and PBM output, and stores one observation per subject through
+    systemd and PBM output, folds in the subject's probe facts (replset, version and
+    process) for a subject whose service is known, and stores one observation per
+    subject through
     :func:`~app.extensions.apps.om_inventory.observations.ingest_collected`. A scan
     whose subject resolved to no member terminates at once with nothing scanned.
 
@@ -1488,6 +1626,15 @@ async def run_scan(run_id: UUID) -> UUID:
             return run_id
         subjects = [ScanSubject.model_validate(subject) for subject in run.subjects]
         profile = run.profile
+        # A subject with a known service becomes a probe target, so its replset,
+        # version and process facts come back alongside its systemd and PBM output.
+        targets: list[MappedService] = []
+        for subject in subjects:
+            if subject.service_id is None:
+                continue
+            service = await get_service(session, subject.service_id)
+            if service is not None:
+                targets.append(_scan_target(subject, service))
 
     if not subjects:
         async with session_maker() as session:
@@ -1504,31 +1651,20 @@ async def run_scan(run_id: UUID) -> UUID:
                 with tasks_api.auth(token):
                     results = await probe_all(
                         tasks_api,
-                        [],
+                        targets,
                         executor_hosts={subject.host for subject in subjects},
                         run_id=run_id,
                         scan_units=list(SCAN_SYSTEMD_UNITS),
                     )
             async with session_maker() as session:
-                for subject in subjects:
-                    result = results.get(subject.host)
-                    host_record = result.host_record if result is not None else None
-                    if host_record is None:
-                        continue
-                    applied = await ingest_collected(
-                        session,
-                        subject_kind=subject.subject_kind,
-                        subject_key=subject.subject_key,
-                        profile=profile,
-                        scan_id=run_id,
-                        collected_at=collected_at,
-                        systemd_units=host_record.get("systemd_units") or {},
-                        pbm_status=host_record.get("pbm_status"),
-                        probe_facts=None,
-                    )
-                    if applied:
-                        observed += 1
-                await session.commit()
+                observed = await _ingest_subjects(
+                    session,
+                    subjects,
+                    results,
+                    profile=profile,
+                    scan_id=run_id,
+                    collected_at=collected_at,
+                )
     except RunLostError:
         logger.warning(
             "OM inventory: scan %s stopped -- it was failed while it ran", run_id
