@@ -35,12 +35,15 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 from app.core.db.crud import BaseSQLModelManager
 from app.core.utils.date_time import make_datetime_utc, utc_now
 from app.extensions.apps.om_inventory.models import (
+    ObservationSubjectKind,
     ObservedEntity,
     OmHost,
+    OmObservation,
     OmService,
     ProbeRun,
     ProbeRunStatus,
     ScanFailure,
+    ScanProfile,
 )
 
 RUN_LEASE = timedelta(minutes=2)
@@ -195,6 +198,15 @@ class OmServiceManager(BaseSQLModelManager):
     """
 
     Model = OmService
+
+
+class OmObservationManager(BaseSQLModelManager):
+    """Manage :class:`OmObservation` CRUD operations.
+
+    :cvar Model: The SQLModel class this manager is responsible for.
+    """
+
+    Model = OmObservation
 
 
 def has_service_clause() -> Any:
@@ -445,6 +457,40 @@ async def get_service(session: AsyncSession, service_id: str) -> OmService | Non
     :return: The service, or ``None``.
     """
     return await OmServiceManager.first(session, service_id=service_id)
+
+
+async def get_observation(
+    session: AsyncSession,
+    subject_kind: ObservationSubjectKind,
+    subject_key: str,
+    profile: ScanProfile,
+) -> OmObservation | None:
+    """Return the current observation for a subject under a profile.
+
+    :param session: The database session.
+    :param subject_kind: What ``subject_key`` names.
+    :param subject_key: The opaque key pmm-managed sent with the scan request.
+    :param profile: The scan profile the facts were collected under.
+    :return: The observation, or ``None`` when no scan has reported the subject.
+    """
+    return await OmObservationManager.first(
+        session,
+        subject_kind=subject_kind,
+        subject_key=subject_key,
+        profile=profile,
+    )
+
+
+async def run_by_idempotency_key(
+    session: AsyncSession, idempotency_key: str
+) -> ProbeRun | None:
+    """Return the scan run already recorded under an idempotency key.
+
+    :param session: The database session.
+    :param idempotency_key: The key a scan request carried.
+    :return: The run fulfilling the key, or ``None`` when none has.
+    """
+    return await ProbeRunManager.first(session, idempotency_key=idempotency_key)
 
 
 async def delete_host(session: AsyncSession, host: OmHost) -> None:
