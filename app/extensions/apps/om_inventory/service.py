@@ -1486,6 +1486,11 @@ PROBE_FACT_ALLOWLIST: frozenset[str] = frozenset(
         "process.program",
         "process.pid",
         "process.uptime_sec",
+        "repo.reachable",
+        "install_readiness.package_manager",
+        "install_readiness.package_manager_present",
+        "install_readiness.data_dir_free_bytes",
+        "install_readiness.no_mongod",
         "binary_version",
         "database.db_version",
         "database.git_version",
@@ -1554,6 +1559,33 @@ def _probe_facts_from_record(record: Mapping[str, Any]) -> dict[str, Any]:
     return {"facts": facts, "classes": classes}
 
 
+def _install_readiness_facts(host_record: Mapping[str, Any]) -> dict[str, Any]:
+    """Classify an install node's readiness facts from the host's own probe record.
+
+    An install node has no service, so its readiness is the host-level OS, repository,
+    package-manager, free-space and process facts the payload collects for every host,
+    not a service record's replica-set and database facts. Two booleans are derived so
+    the consumer gates on a ready-or-not fact rather than reconstructing the polarity:
+    ``package_manager_present`` and ``no_mongod``.
+
+    :param host_record: The host's own parsed probe record.
+    :return: The ``facts`` and ``classes`` mapping ``ingest_collected`` folds in.
+    """
+    install_readiness = dict(host_record.get("install_readiness") or {})
+    process = host_record.get("process") or {}
+    install_readiness["package_manager_present"] = (
+        install_readiness.get("package_manager") is not None
+    )
+    install_readiness["no_mongod"] = not process.get("running")
+    readiness = {
+        "system": host_record.get("system") or {},
+        "repo": host_record.get("repo") or {},
+        "install_readiness": install_readiness,
+        "process": process,
+    }
+    return _probe_facts_from_record(readiness)
+
+
 async def _ingest_subjects(
     session: AsyncSession,
     subjects: list[ScanSubject],
@@ -1580,12 +1612,17 @@ async def _ingest_subjects(
         if result is None or result.host_record is None:
             continue
         host_record = result.host_record
-        record = (
-            result.records.get(subject.service_id)
-            if subject.service_id is not None
-            else None
-        )
-        probe_facts = _probe_facts_from_record(record) if record is not None else None
+        if profile is ScanProfile.INSTALL_CHECK:
+            probe_facts = _install_readiness_facts(host_record)
+        else:
+            record = (
+                result.records.get(subject.service_id)
+                if subject.service_id is not None
+                else None
+            )
+            probe_facts = (
+                _probe_facts_from_record(record) if record is not None else None
+            )
         applied = await ingest_collected(
             session,
             subject_kind=subject.subject_kind,
@@ -1609,9 +1646,9 @@ async def run_scan(run_id: UUID) -> UUID:
     The run row and its subjects are created by ``POST /scans`` before the work
     starts, so this renews the lease, reads the subjects back off the row, dispatches
     the probe to each subject's host under :data:`SCAN_SYSTEMD_UNITS` to capture its
-    systemd and PBM output, folds in the subject's probe facts (replset, version and
-    process) for a subject whose service is known, and stores one observation per
-    subject through
+    systemd and PBM output, folds in the subject's probe facts (the host's readiness
+    facts under the ``install_check`` profile, otherwise the service's replica-set,
+    version and process facts), and stores one observation per subject through
     :func:`~app.extensions.apps.om_inventory.observations.ingest_collected`. A scan
     whose subject resolved to no member terminates at once with nothing scanned.
 
