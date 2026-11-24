@@ -996,6 +996,19 @@ def main():
     host_record["unregistered_mongods"] = find_unregistered(
         processes, targets, matched_process_pids(processes, targets)
     )
+
+    # A scan request also carries the systemd units and PBM status it reads; the
+    # monitored sweep sends no scan_units, so this is skipped and its record unchanged.
+    scan_units = config.get("scan_units")
+    if scan_units:
+        systemd_units = {}
+        for unit in scan_units:
+            output = run_command(["systemctl", "show", unit])
+            if output is not None:
+                systemd_units[unit] = output
+        host_record["systemd_units"] = systemd_units
+        host_record["pbm_status"] = run_command(["pbm", "status", "--out", "json"])
+
     print(json.dumps(host_record, default=str), flush=True)
 
     for target in targets:
