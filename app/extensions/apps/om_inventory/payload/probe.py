@@ -853,6 +853,19 @@ def probe(target, config, host_facts, processes=(), versions=None):
         "tls_mode": options.get("net.tls.mode"),
         "keyfile_path": parse_keyfile_path(config_path),
     }
+    # An uninstall-readiness scan reads the marker (the proof this is PMM's own) and
+    # the sizes of everything a teardown would remove, from this member's own paths.
+    if config.get("collect_removal"):
+        record["marker_run_id"] = read_marker()
+        record["removal_sizes"] = removal_sizes(
+            {
+                "data": options.get("storage.dbPath") or DEFAULT_DATA_PATH,
+                "config": config_path,
+                "keyfile": config_facts["keyfile_path"],
+                "log": options.get("systemLog.path"),
+                "marker": OM_MARKER_PATH,
+            }
+        )
     try:
         record["database"] = collect_database_facts(
             target,
@@ -1059,6 +1072,129 @@ def _free_bytes(path):
         return None
 
 
+#: Path of the on-host install marker ``om_bootstrap`` writes before the package
+#: manager runs (``install_package`` in SEP ``strategies/packages.py``), root-owned and
+#: surviving a successful install. It holds the install run id as plaintext. Uninstall
+#: reads it back to prove a deployment is PMM's own; an absent or empty marker is
+#: reported, not an error.
+OM_MARKER_PATH = "/etc/mongod.om-bootstrap"
+
+#: The PSMDB package family a PMM MongoDB install owns: the ``percona-server-mongodb``
+#: metapackage and its ``-`` dependencies, plus mongosh and the telemetry agent. PBM is
+#: not installed by this flow. The accepted-state ``Install.Packages`` record is the
+#: authority; this on-host set is the cross-check for what a teardown would remove.
+OWNED_PACKAGE_META = "percona-server-mongodb"
+OWNED_PACKAGES = ("percona-mongodb-mongosh", "percona-telemetry-agent")
+
+
+def read_marker(path=OM_MARKER_PATH):
+    """Return the install run id the on-host marker records, or ``None``.
+
+    The marker is the proof a deployment is PMM's own to remove, written as the run id
+    in plaintext. Missing or empty, the answer is ``None``: uninstall readiness treats
+    an absent marker as its own refusal, so the probe reports the absence rather than
+    failing the scan.
+
+    :param path: The marker file path.
+    :return: The run id the marker carries, or ``None``.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            run_id = handle.read().strip()
+    except OSError:
+        return None
+    return run_id or None
+
+
+def collect_owned_packages():
+    """Return the installed packages a PMM MongoDB install owns on this host.
+
+    Queries the host package manager for the PSMDB package family -- the
+    ``percona-server-mongodb`` metapackage and its dependencies, mongosh and the
+    telemetry agent. Best-effort: a host with no supported package manager, or a query
+    that fails, yields an empty list rather than aborting the record.
+
+    :return: The sorted names of owned packages installed on the host.
+    """
+    candidates = set(_query_packages(OWNED_PACKAGE_META + "*"))
+    for name in OWNED_PACKAGES:
+        candidates.update(_query_packages(name))
+    return sorted(name for name in candidates if _owns_package(name))
+
+
+def _owns_package(name):
+    """Return whether ``name`` is a package a PMM MongoDB install owns.
+
+    :param name: The installed package name to classify.
+    :return: Whether an uninstall would own and remove it.
+    """
+    return (
+        name == OWNED_PACKAGE_META
+        or name.startswith(OWNED_PACKAGE_META + "-")
+        or name in OWNED_PACKAGES
+    )
+
+
+def _query_packages(pattern):
+    """Return the installed package names matching ``pattern``, or an empty list.
+
+    :param pattern: The package-name glob the host package manager understands.
+    :return: The matching installed package names.
+    """
+    if shutil.which("dpkg-query"):
+        output = run_command(["dpkg-query", "-W", "-f", "${Package}\\n", pattern])
+    elif shutil.which("rpm"):
+        output = run_command(["rpm", "-qa", pattern])
+    else:
+        return []
+    if not output:
+        return []
+    return [line.strip() for line in output.splitlines() if line.strip()]
+
+
+def _path_size(path):
+    """Return the total byte size at ``path``, recursing a directory, or ``None``.
+
+    :param path: The filesystem path to measure.
+    :return: The byte size, or ``None`` when the path is absent or cannot be read.
+    """
+    try:
+        if os.path.isfile(path):
+            return os.path.getsize(path)
+        if not os.path.isdir(path):
+            return None
+    except OSError:
+        return None
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                continue
+    return total
+
+
+def removal_sizes(paths):
+    """Return a label to byte-size mapping for each removal path that exists.
+
+    Informational only: the sizes a report shows an operator before a destructive
+    uninstall. A path that is absent or unreadable is omitted rather than reported as
+    zero, so "not there" and "empty" stay distinguishable.
+
+    :param paths: A label to path mapping of the files and directories removal covers.
+    :return: A label to byte-size mapping for the paths present on the host.
+    """
+    sizes = {}
+    for label, path in paths.items():
+        if not path:
+            continue
+        size = _path_size(path)
+        if size is not None:
+            sizes[label] = size
+    return sizes
+
+
 def main():
     """Print one JSON object for the host, then one per configured target.
 
@@ -1136,6 +1272,11 @@ def main():
                 systemd_units[unit] = output
         host_record["systemd_units"] = systemd_units
         host_record["pbm_status"] = run_command(["pbm", "status", "--out", "json"])
+
+    # An uninstall-readiness scan reports what a teardown would own and remove. The
+    # packages are a host property; the marker and sizes are per member, below.
+    if config.get("collect_removal"):
+        host_record["owned_packages"] = collect_owned_packages()
 
     print(json.dumps(host_record, default=str), flush=True)
 

@@ -1730,6 +1730,7 @@ async def run_scan(run_id: UUID) -> UUID:
                         executor_hosts={subject.host for subject in subjects},
                         run_id=run_id,
                         scan_units=list(SCAN_SYSTEMD_UNITS),
+                        collect_removal=profile == ScanProfile.UNINSTALL_CHECK,
                     )
             async with session_maker() as session:
                 observed, answered_services = await _ingest_subjects(

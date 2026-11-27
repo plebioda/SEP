@@ -347,7 +347,10 @@ def record_key(service_id: str | None, service_name: str | None) -> str:
 
 
 def build_config(
-    entries: list[MappedService], scan_units: list[str] | None = None
+    entries: list[MappedService],
+    scan_units: list[str] | None = None,
+    *,
+    collect_removal: bool = False,
 ) -> str:
     """Build the payload config for one executor host's targets.
 
@@ -355,6 +358,9 @@ def build_config(
     :param scan_units: The systemd units a scan reads with ``systemctl show``; its
         presence also turns on the ``pbm status`` read. ``None`` on the monitored
         sweep, which leaves the config, and so the payload's work, unchanged.
+    :param collect_removal: Whether the payload also reports the install marker, owned
+        packages and removal sizes an uninstall-readiness scan needs. ``False`` on
+        every other profile, which leaves the payload's work unchanged.
     :return: The JSON config placed in ``meta.config``.
     """
     config: dict[str, Any] = {
@@ -381,6 +387,8 @@ def build_config(
     }
     if scan_units is not None:
         config["scan_units"] = list(scan_units)
+    if collect_removal:
+        config["collect_removal"] = True
     return json.dumps(config, separators=(",", ":"), sort_keys=True)
 
 
@@ -612,6 +620,8 @@ async def probe_host(
     entries: list[MappedService],
     run_id: UUID | None = None,
     scan_units: list[str] | None = None,
+    *,
+    collect_removal: bool = False,
 ) -> HostProbeResult:
     """Dispatch the probe to one executor host and collect its records.
 
@@ -624,6 +634,8 @@ async def probe_host(
     :param run_id: The run dispatching it, stored as :data:`RUN_META_KEY`.
     :param scan_units: The systemd units a scan reads on the host; ``None`` on the
         monitored sweep, which leaves the dispatch unchanged.
+    :param collect_removal: Whether to request the uninstall-readiness removal facts;
+        ``False`` on every other profile.
     :return: The host's probe outcome.
     """
     result = HostProbeResult(executor_host=executor_host)
@@ -638,7 +650,9 @@ async def probe_host(
                     json={
                         "meta": {
                             "target": executor_host,
-                            "config": build_config(entries, scan_units),
+                            "config": build_config(
+                                entries, scan_units, collect_removal=collect_removal
+                            ),
                             "requirements": REQUIREMENTS,
                             "_job_id_prefix": JOB_ID_PREFIX,
                             **({RUN_META_KEY: str(run_id)} if run_id else {}),
@@ -747,6 +761,8 @@ async def probe_all(
     on_host_done: Callable[[HostProbeResult], Awaitable[None]] | None = None,
     run_id: UUID | None = None,
     scan_units: list[str] | None = None,
+    *,
+    collect_removal: bool = False,
 ) -> dict[str, HostProbeResult]:
     """Probe every executor host in reach, concurrently.
 
@@ -767,6 +783,8 @@ async def probe_all(
     :param run_id: The run dispatching the probes, passed to :func:`probe_host`.
     :param scan_units: The systemd units a scan reads, passed to :func:`probe_host`;
         ``None`` on the monitored sweep.
+    :param collect_removal: Whether to request the uninstall-readiness removal facts,
+        passed to :func:`probe_host`; ``False`` on every other profile.
     :return: One result per executor host, keyed by host.
     """
     grouped = group_by_executor(mapped)
@@ -784,7 +802,12 @@ async def probe_all(
     async def guarded(host: str, entries: list[MappedService]) -> HostProbeResult:
         async with semaphore:
             result = await probe_host(
-                tasks_api, host, entries, run_id=run_id, scan_units=scan_units
+                tasks_api,
+                host,
+                entries,
+                run_id=run_id,
+                scan_units=scan_units,
+                collect_removal=collect_removal,
             )
         if on_host_done is not None:
             await on_host_done(result)
